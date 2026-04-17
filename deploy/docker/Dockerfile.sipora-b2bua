@@ -1,5 +1,8 @@
 FROM rust:1.86-bookworm AS builder
 WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake pkg-config libcurl4-openssl-dev libsasl2-dev zlib1g-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --bin sipora-b2bua
 
