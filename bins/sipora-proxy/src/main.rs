@@ -1,0 +1,84 @@
+mod redirect;
+mod routing;
+mod udp;
+
+use anyhow::Result;
+use clap::Parser;
+use sipora_core::health::serve_health;
+use sipora_core::health_ready::AtomicReady;
+use std::net::SocketAddr;
+use tokio::sync::watch;
+
+#[derive(Parser)]
+#[command(
+    name = "sipora-proxy",
+    about = "SIP proxy, registrar, and redirect server"
+)]
+struct Cli {
+    #[arg(long, env = "SIPORA_CONFIG", default_value = "sipora")]
+    config: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let config = sipora_core::config::SiporaConfig::load_from_config_input(&cli.config)?;
+
+    let _telemetry = sipora_core::telemetry::init_telemetry(
+        "sipora-proxy",
+        &config.telemetry.otlp_endpoint,
+        config.telemetry.metrics_interval_s,
+        config.telemetry.success_sample_rate,
+    )?;
+
+    let ready = AtomicReady::new();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_health = shutdown_rx.clone();
+    let health_addr = SocketAddr::from(([0, 0, 0, 0], config.general.health_port));
+    let rh = ready.clone();
+    tokio::spawn(async move {
+        let _ = serve_health(health_addr, rh, shutdown_health).await;
+    });
+
+    let pool = sipora_core::redis::connect_pool(&config.redis)
+        .await
+        .map_err(|e| anyhow::anyhow!("redis: {e}"))?;
+
+    let sip_addr = SocketAddr::from(([0, 0, 0, 0], config.general.sip_udp_port));
+    let mf = config.proxy.max_forwards;
+    let domain_cfg = config.general.domain.clone();
+    let advertise = config
+        .general
+        .sip_advertised_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let sip_port = config.general.sip_udp_port;
+    let min_exp = config.registrar.min_expires;
+    let max_exp = config.registrar.max_expires;
+    let def_exp = config.registrar.default_expires;
+    let udp_cfg = udp::UdpProxyConfig {
+        domain: domain_cfg,
+        advertise,
+        sip_port,
+        max_forwards: mf,
+        registrar: udp::RegistrarLimits {
+            min_expires: min_exp,
+            max_expires: max_exp,
+            default_expires: def_exp,
+        },
+    };
+    tokio::spawn(async move {
+        if let Err(e) = udp::run_udp_proxy(sip_addr, pool, udp_cfg, shutdown_rx).await {
+            tracing::error!("udp proxy: {e}");
+        }
+    });
+
+    ready.set_ready(true);
+    tracing::info!(udp = %sip_addr, health = %health_addr, "sipora-proxy listening");
+
+    tokio::signal::ctrl_c().await?;
+    let _ = shutdown_tx.send(true);
+    tracing::info!("shutting down");
+    Ok(())
+}

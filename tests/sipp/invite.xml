@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="SIP INVITE">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:[field1]@[remote_ip] SIP/2.0
+      Via: SIP/2.0/TLS [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field1]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=tls>
+      Max-Forwards: 70
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=- 1234 1234 IN IP4 [local_ip]
+      s=SIPp Test
+      c=IN IP4 [local_ip]
+      t=0 0
+      m=audio [local_port] RTP/SAVP 0
+      a=rtpmap:0 PCMU/8000
+      a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:[field2]
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="200" />
+
+  <send>
+    <![CDATA[
+      ACK sip:[field1]@[remote_ip] SIP/2.0
+      Via: SIP/2.0/TLS [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field1]@[remote_ip]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Hold call for 5 seconds -->
+  <pause milliseconds="5000" />
+
+  <send retrans="500">
+    <![CDATA[
+      BYE sip:[field1]@[remote_ip] SIP/2.0
+      Via: SIP/2.0/TLS [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field1]@[remote_ip]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" />
+</scenario>

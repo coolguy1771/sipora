@@ -1,0 +1,11 @@
+[package]
+name = "sipora-sdp"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sdp-types = { workspace = true }
+thiserror = { workspace = true }

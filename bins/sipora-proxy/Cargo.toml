@@ -1,0 +1,26 @@
+[package]
+name = "sipora-proxy"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sipora-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+uuid = { workspace = true }
+sipora-core = { workspace = true }
+sipora-sip = { workspace = true }
+sipora-transport = { workspace = true }
+sipora-auth = { workspace = true }
+sipora-location = { workspace = true }
+sipora-data = { workspace = true }
+sipora-edge = { workspace = true }

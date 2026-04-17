@@ -1,0 +1,66 @@
+# Example for sipora-edge (TLS termination, rate limiting, firewall).
+# Copy to sipora.toml in the working directory, or set SIPORA_CONFIG=sipora
+# and merge with SIPORA__* overrides.
+
+[general]
+domain = "sip.example.com"
+sips_port = 5061
+wss_port = 443
+outbound_port = 5065
+health_port = 8080
+
+[tls]
+min_version = "1.3"
+mtls_trunks = true
+ocsp_staple = true
+# Optional: DER OCSP response for TLS stapling (from CA or `openssl ocsp`).
+# ocsp_response_der_path = "/path/to/ocsp.der"
+cert_renew_threshold = 0.8
+acme_provider = "letsencrypt"
+
+[rate_limit]
+register_rate = 15
+invite_rate = 8
+dialog_rate = 80
+block_threshold = 5
+block_window_s = 60
+block_cooldown_s = 300
+
+[registrar]
+min_expires = 60
+max_expires = 3600
+default_expires = 600
+nonce_ttl_s = 60
+
+[proxy]
+max_forwards = 70
+fork_parallel = true
+trace_header = "X-Trace-ID"
+location_timeout_ms = 50
+
+[auth]
+nonce_ttl_s = 60
+nonce_len = 32
+auth_timeout_ms = 50
+
+[redis]
+nodes = ["redis://127.0.0.1:6379"]
+cluster_mode = false
+max_call_s = 14400
+
+[postgres]
+url = "postgres://127.0.0.1:5432/sipora"
+max_pool_size = 200
+cdr_retention_months = 24
+
+[telemetry]
+otlp_endpoint = "http://127.0.0.1:4317"
+service_name = "sipora-edge"
+metrics_interval_s = 15
+success_sample_rate = 0.05
+
+[media]
+rtpengine_host = "rtp-proxy.internal"
+allowed_codecs = ["opus", "G722", "G711u", "G711a"]
+srtp_required = true
+rtp_timeout_s = 30

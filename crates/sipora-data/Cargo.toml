@@ -1,0 +1,23 @@
+[package]
+name = "sipora-data"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rdkafka = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+sipora-auth = { workspace = true }
+sipora-core = { workspace = true }
+utoipa = { workspace = true, features = ["uuid", "chrono"] }

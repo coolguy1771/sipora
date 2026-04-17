@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: sipora_test
+      POSTGRES_USER: sipora
+      POSTGRES_PASSWORD: test_only_not_production
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sipora"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  alloy:
+    image: grafana/alloy:latest
+    volumes:
+      - ../deploy/grafana/alloy.river:/etc/alloy/config.river
+    command: run /etc/alloy/config.river
+    environment:
+      MIMIR_URL: http://mimir:9009/api/v1/push
+      TEMPO_URL: http://tempo:4318
+      LOKI_URL: http://loki:3100/otlp
+      COTURN_METRICS_ADDR: coturn:9641
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - mimir
+      - tempo
+      - loki
+
+  mimir:
+    image: grafana/mimir:latest
+    volumes:
+      - ../deploy/grafana/mimir.yaml:/etc/mimir/config.yaml
+    command: -config.file=/etc/mimir/config.yaml
+    ports:
+      - "9009:9009"
+
+  tempo:
+    image: grafana/tempo:latest
+    volumes:
+      - ../deploy/grafana/tempo.yaml:/etc/tempo/config.yaml
+    command: -config.file=/etc/tempo/config.yaml
+    ports:
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:latest
+    volumes:
+      - ../deploy/grafana/loki.yaml:/etc/loki/config.yaml
+    command: -config.file=/etc/loki/config.yaml
+    ports:
+      - "3100:3100"
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mimir
+      - tempo
+      - loki
+    volumes:
+      - ../deploy/grafana/dashboards:/var/lib/grafana/dashboards

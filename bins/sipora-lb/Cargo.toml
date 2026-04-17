@@ -1,0 +1,21 @@
+[package]
+name = "sipora-lb"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sipora-lb"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+sipora-core = { workspace = true }
+sipora-sip = { workspace = true }
+sipora-transport = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "sipora-edge"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+fred = { workspace = true }
+sipora-sip = { workspace = true }
+sipora-core = { workspace = true }

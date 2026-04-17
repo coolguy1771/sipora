@@ -1,0 +1,16 @@
+[package]
+name = "sipora-location"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+fred = { workspace = true }
+sipora-core = { workspace = true }
