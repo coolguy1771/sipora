@@ -1,0 +1,48 @@
+name: Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  postgres-redis:
+    name: Migrations and tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: sipora
+          POSTGRES_PASSWORD: test_only_not_production
+          POSTGRES_DB: sipora_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply SQL migrations
+        env:
+          DATABASE_URL: postgres://sipora:test_only_not_production@localhost:5432/sipora_test
+        run: cargo run -p sipora-migrate -- --database-url "$DATABASE_URL"
+      - name: Cargo test
+        run: cargo test --workspace
