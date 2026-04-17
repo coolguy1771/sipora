@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sipora-proxy
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sipora-proxy
+    app.kubernetes.io/component: core
+spec:
+  replicas: {{ .Values.proxy.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sipora-proxy
+    spec:
+      serviceAccountName: sipora-proxy
+      containers:
+        - name: sipora-proxy
+          image: "{{ .Values.image.registry }}sipora/sipora-proxy:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: sip-udp
+              protocol: UDP
+              containerPort: {{ .Values.config.general.sipUdpPort }}
+            - name: health
+              protocol: TCP
+              containerPort: {{ .Values.config.general.healthPort }}
+          env:
+            - name: SIPORA__GENERAL__DOMAIN
+              value: {{ .Values.config.domain | quote }}
+            {{- include "sipora.env.generalUdp" . | nindent 12 }}
+            {{- include "sipora.env.redis" . | nindent 12 }}
+            {{- include "sipora.env.telemetry" . | nindent 12 }}
+            {{- include "sipora.env.postgresUrl" . | nindent 12 }}
+            - name: OTEL_SERVICE_NAME
+              value: sipora-proxy
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sipora-proxy
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: sipora-proxy
+  ports:
+    - name: sip-udp
+      port: {{ .Values.config.general.sipUdpPort }}
+      protocol: UDP
+      targetPort: sip-udp
+    - name: health
+      port: {{ .Values.config.general.healthPort }}
+      protocol: TCP
+      targetPort: health
+{{- if .Values.proxy.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sipora-proxy
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sipora-proxy
+  minReplicas: {{ .Values.proxy.hpa.minReplicas }}
+  maxReplicas: {{ .Values.proxy.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.proxy.hpa.targetCPUUtilization }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sipora-proxy
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-proxy

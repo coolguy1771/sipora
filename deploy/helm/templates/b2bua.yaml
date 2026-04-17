@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sipora-b2bua
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sipora-b2bua
+    app.kubernetes.io/component: b2bua
+spec:
+  replicas: {{ .Values.b2bua.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-b2bua
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sipora-b2bua
+    spec:
+      serviceAccountName: sipora-b2bua
+      containers:
+        - name: sipora-b2bua
+          image: "{{ .Values.image.registry }}sipora/sipora-b2bua:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: sip-udp
+              protocol: UDP
+              containerPort: {{ .Values.config.general.sipUdpPort }}
+            - name: health
+              protocol: TCP
+              containerPort: {{ .Values.config.general.healthPort }}
+          env:
+            - name: SIPORA__GENERAL__DOMAIN
+              value: {{ .Values.config.domain | quote }}
+            {{- include "sipora.env.generalUdp" . | nindent 12 }}
+            {{- include "sipora.env.telemetry" . | nindent 12 }}
+            {{- include "sipora.env.postgresUrl" . | nindent 12 }}
+            - name: SIPORA__B2BUA__DOWNSTREAM
+              value: {{ include "sipora.b2buaDownstream" . | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: sipora-b2bua
+          resources:
+            {{- toYaml .Values.b2bua.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sipora-b2bua
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: sipora-b2bua
+  ports:
+    - name: sip-udp
+      port: {{ .Values.config.general.sipUdpPort }}
+      protocol: UDP
+      targetPort: sip-udp
+    - name: health
+      port: {{ .Values.config.general.healthPort }}
+      protocol: TCP
+      targetPort: health
+{{- if .Values.b2bua.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sipora-b2bua
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sipora-b2bua
+  minReplicas: {{ .Values.b2bua.hpa.minReplicas }}
+  maxReplicas: {{ .Values.b2bua.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.b2bua.hpa.targetCPUUtilization }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sipora-b2bua
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-b2bua

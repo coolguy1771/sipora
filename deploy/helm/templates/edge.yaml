@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sipora-edge
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sipora-edge
+    app.kubernetes.io/component: edge
+spec:
+  replicas: {{ .Values.edge.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-edge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sipora-edge
+    spec:
+      serviceAccountName: sipora-edge
+      containers:
+        - name: sipora-edge
+          image: "{{ .Values.image.registry }}sipora/sipora-edge:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: sips
+              containerPort: {{ .Values.edge.ports.sips }}
+            - name: wss
+              containerPort: {{ .Values.edge.ports.wss }}
+            - name: outbound
+              containerPort: {{ .Values.edge.ports.outbound }}
+            - name: health
+              containerPort: {{ .Values.edge.ports.health }}
+          env:
+            - name: SIPORA__GENERAL__DOMAIN
+              value: {{ .Values.config.domain | quote }}
+            - name: SIPORA__GENERAL__SIPS_PORT
+              value: {{ .Values.edge.ports.sips | quote }}
+            - name: SIPORA__GENERAL__HEALTH_PORT
+              value: {{ .Values.edge.ports.health | quote }}
+            - name: SIPORA__GENERAL__WSS_PORT
+              value: {{ .Values.edge.ports.wss | quote }}
+            - name: SIPORA__GENERAL__OUTBOUND_PORT
+              value: {{ .Values.edge.ports.outbound | quote }}
+            {{- include "sipora.env.redis" . | nindent 12 }}
+            {{- include "sipora.env.telemetry" . | nindent 12 }}
+            - name: OTEL_SERVICE_NAME
+              value: sipora-edge
+          resources:
+            {{- toYaml .Values.edge.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sipora-edge
+  namespace: {{ .Values.namespace }}
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: sipora-edge
+  ports:
+    - name: sips
+      port: {{ .Values.edge.ports.sips }}
+      targetPort: sips
+    - name: wss
+      port: {{ .Values.edge.ports.wss }}
+      targetPort: wss
+    - name: outbound
+      port: {{ .Values.edge.ports.outbound }}
+      targetPort: outbound
+    - name: health
+      port: {{ .Values.edge.ports.health }}
+      targetPort: health
+{{- if .Values.edge.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sipora-edge
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sipora-edge
+  minReplicas: {{ .Values.edge.hpa.minReplicas }}
+  maxReplicas: {{ .Values.edge.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.edge.hpa.targetCPUUtilization }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sipora-edge
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-edge

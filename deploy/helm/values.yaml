@@ -1,0 +1,118 @@
+namespace: sip-platform
+
+image:
+  registry: ""
+  tag: latest
+  pullPolicy: IfNotPresent
+
+edge:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 500m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilization: 70
+  ports:
+    sips: 5061
+    wss: 443
+    outbound: 5065
+    health: 8080
+
+lb:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 500m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilization: 70
+
+proxy:
+  replicas: 3
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "4"
+      memory: 2Gi
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilization: 70
+
+b2bua:
+  replicas: 2
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "4"
+      memory: 2Gi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 15
+    targetCPUUtilization: 70
+
+api:
+  replicas: 2
+  mockStore: false
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilization: 65
+
+config:
+  domain: example.com
+  general:
+    sipUdpPort: 5060
+    healthPort: 8080
+  telemetry:
+    otlpEndpoint: http://alloy:4317
+    metricsIntervalS: 15
+    successSampleRate: 0.05
+  redis:
+    nodes:
+      - redis-0:6379
+      - redis-1:6379
+      - redis-2:6379
+    clusterMode: true
+  postgres:
+    host: postgresql
+    port: 5432
+    database: sipora
+    maxPoolSize: 200
+    existingSecret: sipora-db-credentials
+    existingSecretKey: url
+  upstreams:
+    lbSipProxies:
+      - sipora-proxy:5060
+  b2bua:
+    downstream: ""
+
+migrate:
+  enabled: false

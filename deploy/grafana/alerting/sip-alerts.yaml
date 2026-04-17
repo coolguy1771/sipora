@@ -1,0 +1,57 @@
+groups:
+  - name: sip_platform
+    interval: 15s
+    rules:
+      - alert: SIPAnswerSeizureRatio
+        expr: |
+          (
+            sum(rate(sip_calls_total{result_code=~"2.."}[5m]))
+            /
+            sum(rate(sip_calls_total[5m]))
+          ) < 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SIP Answer-Seizure Ratio below 90%"
+          description: "ASR is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+      - alert: SIPSetupLatencyHigh
+        expr: histogram_quantile(0.99, rate(sip_setup_seconds_bucket[5m])) > 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SIP INVITE setup p99 latency exceeds 3 seconds"
+          description: "p99 setup latency is {{ $value }}s."
+
+      - alert: RegistrationDrop
+        expr: |
+          (
+            rate(sip_register_total{result="200"}[5m])
+            /
+            rate(sip_register_total{result="200"}[5m] offset 5m)
+          ) < 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SIP registration success rate dropped >10%"
+
+      - alert: MediaPacketLoss
+        expr: rtp_packet_loss_ratio > 0.02
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RTP packet loss exceeds 2%"
+          description: "Stream {{ $labels.call_id }} has {{ $value | humanizePercentage }} packet loss."
+
+      - alert: CertExpirySoon
+        expr: (sip_tls_cert_expiry_seconds - time()) < (18 * 24 * 3600)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TLS certificate expires in less than 18 days"
+          description: "Certificate for {{ $labels.domain }} expires in {{ $value | humanizeDuration }}."

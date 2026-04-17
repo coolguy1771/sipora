@@ -1,0 +1,14 @@
+config:
+  domain: sip.example.com
+  telemetry:
+    successSampleRate: 0.05
+
+proxy:
+  replicas: 5
+  hpa:
+    maxReplicas: 30
+
+b2bua:
+  replicas: 3
+  hpa:
+    maxReplicas: 20

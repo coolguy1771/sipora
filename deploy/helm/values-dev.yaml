@@ -1,0 +1,30 @@
+proxy:
+  replicas: 1
+  hpa:
+    enabled: false
+
+b2bua:
+  replicas: 1
+  hpa:
+    enabled: false
+
+edge:
+  replicas: 1
+  hpa:
+    enabled: false
+
+lb:
+  replicas: 1
+  hpa:
+    enabled: false
+
+api:
+  replicas: 1
+  mockStore: true
+  hpa:
+    enabled: false
+
+config:
+  domain: dev.example.com
+  telemetry:
+    successSampleRate: 1.0

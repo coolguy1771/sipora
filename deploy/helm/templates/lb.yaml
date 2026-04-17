@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sipora-lb
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sipora-lb
+    app.kubernetes.io/component: lb
+spec:
+  replicas: {{ .Values.lb.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-lb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sipora-lb
+    spec:
+      serviceAccountName: sipora-lb
+      containers:
+        - name: sipora-lb
+          image: "{{ .Values.image.registry }}sipora/sipora-lb:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: sip-udp
+              protocol: UDP
+              containerPort: {{ .Values.config.general.sipUdpPort }}
+            - name: health
+              protocol: TCP
+              containerPort: {{ .Values.config.general.healthPort }}
+          env:
+            - name: SIPORA__GENERAL__DOMAIN
+              value: {{ .Values.config.domain | quote }}
+            {{- include "sipora.env.generalUdp" . | nindent 12 }}
+            {{- include "sipora.env.redis" . | nindent 12 }}
+            {{- include "sipora.env.telemetry" . | nindent 12 }}
+            {{- include "sipora.env.lbUpstreams" . | nindent 12 }}
+            - name: OTEL_SERVICE_NAME
+              value: sipora-lb
+          resources:
+            {{- toYaml .Values.lb.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sipora-lb
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: sipora-lb
+  ports:
+    - name: sip-udp
+      port: {{ .Values.config.general.sipUdpPort }}
+      protocol: UDP
+      targetPort: sip-udp
+    - name: health
+      port: {{ .Values.config.general.healthPort }}
+      protocol: TCP
+      targetPort: health
+{{- if .Values.lb.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sipora-lb
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sipora-lb
+  minReplicas: {{ .Values.lb.hpa.minReplicas }}
+  maxReplicas: {{ .Values.lb.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.lb.hpa.targetCPUUtilization }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sipora-lb
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-lb

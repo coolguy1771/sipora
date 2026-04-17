@@ -1,0 +1,26 @@
+{{- if .Values.migrate.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migrate-{{ .Release.Revision | default "1" }}
+  namespace: {{ .Values.namespace }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: sipora-migrate
+      containers:
+        - name: sipora-migrate
+          image: "{{ .Values.image.registry }}sipora/sipora-migrate:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.postgres.existingSecret }}
+                  key: {{ .Values.config.postgres.existingSecretKey }}
+{{- end }}

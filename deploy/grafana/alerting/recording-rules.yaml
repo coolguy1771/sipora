@@ -1,0 +1,30 @@
+groups:
+  - name: sip_recording_rules
+    interval: 15s
+    rules:
+      - record: sip:setup_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum(rate(sip_setup_seconds_bucket[5m])) by (le, method))
+
+      - record: sip:setup_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum(rate(sip_setup_seconds_bucket[5m])) by (le, method))
+
+      - record: sip:setup_seconds:p50_5m
+        expr: histogram_quantile(0.50, sum(rate(sip_setup_seconds_bucket[5m])) by (le, method))
+
+      - record: sip:calls_rate:5m
+        expr: sum(rate(sip_calls_total[5m])) by (method, result_code)
+
+      - record: sip:register_rate:5m
+        expr: sum(rate(sip_register_total[5m])) by (result)
+
+      - record: sip:ratelimit_rate:5m
+        expr: sum(rate(sip_ratelimit_total[5m])) by (method, reason)
+
+      - record: sip:auth_failure_rate:5m
+        expr: sum(rate(sip_auth_total{result="failed"}[5m]))
+
+      - record: sip:asr_5m
+        expr: |
+          sum(rate(sip_calls_total{result_code=~"2.."}[5m]))
+          /
+          sum(rate(sip_calls_total[5m]))

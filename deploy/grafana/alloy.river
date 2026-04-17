@@ -1,0 +1,58 @@
+logging {
+  level = "info"
+}
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.default.input]
+    logs    = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  timeout = "5s"
+  send_batch_size = 1024
+  output {
+    metrics = [otelcol.exporter.prometheus.mimir.input]
+    traces  = [otelcol.exporter.otlphttp.tempo.input]
+    logs    = [otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+otelcol.exporter.prometheus "mimir" {
+  forward_to = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = env("MIMIR_URL")
+  }
+}
+
+otelcol.exporter.otlphttp "tempo" {
+  client {
+    endpoint = env("TEMPO_URL")
+  }
+}
+
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = env("LOKI_URL")
+  }
+}
+
+// Scrape coturn Prometheus metrics (external service)
+prometheus.scrape "coturn" {
+  targets = [{
+    __address__ = env("COTURN_METRICS_ADDR"),
+  }]
+  forward_to = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "15s"
+}

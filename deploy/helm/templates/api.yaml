@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sipora-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sipora-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sipora-api
+    spec:
+      serviceAccountName: sipora-api
+      containers:
+        - name: sipora-api
+          image: "{{ .Values.image.registry }}sipora/sipora-api:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              protocol: TCP
+              containerPort: 8080
+          env:
+            - name: SIPORA__GENERAL__DOMAIN
+              value: {{ .Values.config.domain | quote }}
+            - name: SIPORA_API_PORT
+              value: "8080"
+            - name: SIPORA_API_MOCK_STORE
+              value: {{ .Values.api.mockStore | quote }}
+            {{- include "sipora.env.telemetry" . | nindent 12 }}
+            {{- include "sipora.env.postgresUrl" . | nindent 12 }}
+            - name: OTEL_SERVICE_NAME
+              value: sipora-api
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sipora-api
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: sipora-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- if .Values.api.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sipora-api
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sipora-api
+  minReplicas: {{ .Values.api.hpa.minReplicas }}
+  maxReplicas: {{ .Values.api.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.hpa.targetCPUUtilization }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sipora-api
+  namespace: {{ .Values.namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sipora-api
