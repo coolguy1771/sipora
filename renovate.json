@@ -1,5 +1,18 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:best-practices"],
-  "labels": ["dependencies"]
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 5,
+  "cargo": {
+    "rangeStrategy": "bump"
+  },
+  "packageRules": [
+    {
+      "description": "Semver-major crate releases often need API or behavior review",
+      "matchManagers": ["cargo"],
+      "matchDatasources": ["crate"],
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["breaking"]
+    }
+  ]
 }
