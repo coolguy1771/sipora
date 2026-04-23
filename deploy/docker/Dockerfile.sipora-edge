@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 RUN cargo build --release --bin sipora-edge
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/sipora-edge /usr/local/bin/
 EXPOSE 5061 443 5065 8080
