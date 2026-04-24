@@ -18,6 +18,15 @@ pub fn register_commit_lock_key(call_id: &str, cseq: u32) -> String {
     format!("register_lock:{call_id}:{cseq}")
 }
 
+/// KEYS[1] = lock key, ARGV[1] = token set at acquire. Deletes only if value matches.
+pub const LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH: &str = r#"
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+"#;
+
 pub fn location_key(domain: &str, user: &str) -> String {
     format!("{LOCATION_KEY_PREFIX}:{domain}:{user}")
 }

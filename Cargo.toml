@@ -57,7 +57,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
 
 # Redis
-fred = { version = "10", features = ["subscriber-client", "metrics"] }
+fred = { version = "10", features = ["subscriber-client", "metrics", "i-scripts"] }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build"] }
