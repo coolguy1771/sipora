@@ -42,7 +42,7 @@ impl MockData {
             .filter(|u| u.domain == domain)
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|u| std::cmp::Reverse(u.created_at));
         v
     }
 
