@@ -31,9 +31,12 @@ async fn health_returns_json_and_security_headers() {
             .and_then(|v| v.to_str().ok()),
         Some("nosniff")
     );
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
-        Request::builder().uri("/health").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -45,9 +48,12 @@ async fn health_returns_json_and_security_headers() {
 #[tokio::test]
 async fn ready_ok_for_mock_store() {
     let app = app_mock();
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
-        Request::builder().uri("/ready").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -56,7 +62,7 @@ async fn ready_ok_for_mock_store() {
 #[tokio::test]
 async fn openapi_json_served() {
     let app = app_mock();
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api-docs/openapi.json")
@@ -72,7 +78,7 @@ async fn openapi_json_served() {
 #[tokio::test]
 async fn swagger_ui_route_exists() {
     let app = app_mock();
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/swagger-ui")
@@ -92,7 +98,7 @@ async fn swagger_ui_route_exists() {
 #[tokio::test]
 async fn api_disabled_without_bearer_config() {
     let app = router(mock_state(DOMAIN, None));
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api/v1/users")
@@ -107,7 +113,7 @@ async fn api_disabled_without_bearer_config() {
 #[tokio::test]
 async fn api_unauthorized_without_header() {
     let app = app_mock();
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api/v1/users")
@@ -122,7 +128,7 @@ async fn api_unauthorized_without_header() {
 async fn api_unauthorized_wrong_token() {
     let app = app_mock();
     let (h, v) = bearer("wrong-token");
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api/v1/users")
@@ -138,7 +144,7 @@ async fn api_unauthorized_wrong_token() {
 async fn users_list_empty_then_create_list_get() {
     let app = app_mock();
     let (bh, bv) = bearer(TOKEN);
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app.clone(),
         Request::builder()
             .uri("/api/v1/users")
@@ -157,7 +163,7 @@ async fn users_list_empty_then_create_list_get() {
         "password": "s3cret-long",
         "enabled": true,
     });
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app.clone(),
         Request::builder()
             .method("POST")
@@ -172,7 +178,7 @@ async fn users_list_empty_then_create_list_get() {
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["id"].as_str().unwrap().to_string();
 
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app.clone(),
         Request::builder()
             .uri("/api/v1/users")
@@ -186,7 +192,7 @@ async fn users_list_empty_then_create_list_get() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["username"], "alice");
 
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app.clone(),
         Request::builder()
             .uri(format!("/api/v1/users/{id}"))
@@ -210,7 +216,7 @@ async fn create_user_rejects_domain_mismatch() {
         "domain": "other.example",
         "password": "x",
     });
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .method("POST")
@@ -235,7 +241,7 @@ async fn create_user_conflict_duplicate() {
         "password": "p1",
     });
     for _ in 0..2 {
-        let _ = text_response(
+        let _: (StatusCode, String) = text_response(
             app.clone(),
             Request::builder()
                 .method("POST")
@@ -247,7 +253,7 @@ async fn create_user_conflict_duplicate() {
         )
         .await;
     }
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .method("POST")
@@ -270,7 +276,7 @@ async fn create_user_validation_empty_fields() {
         "domain": DOMAIN,
         "password": "x",
     });
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .method("POST")
@@ -288,7 +294,7 @@ async fn create_user_validation_empty_fields() {
 async fn get_user_invalid_uuid() {
     let app = app_mock();
     let (bh, bv) = bearer(TOKEN);
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api/v1/users/not-a-uuid")
@@ -305,7 +311,7 @@ async fn get_user_not_found() {
     let app = app_mock();
     let (bh, bv) = bearer(TOKEN);
     let id = uuid::Uuid::new_v4();
-    let (st, _) = text_response(
+    let (st, _): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri(format!("/api/v1/users/{id}"))
@@ -321,7 +327,7 @@ async fn get_user_not_found() {
 async fn cdrs_empty_on_mock() {
     let app = app_mock();
     let (bh, bv) = bearer(TOKEN);
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api/v1/cdrs")
@@ -339,7 +345,7 @@ async fn cdrs_empty_on_mock() {
 async fn cdrs_bad_correlation_id() {
     let app = app_mock();
     let (bh, bv) = bearer(TOKEN);
-    let (st, body) = text_response(
+    let (st, body): (StatusCode, String) = text_response(
         app,
         Request::builder()
             .uri("/api/v1/cdrs?correlation_id=bad")

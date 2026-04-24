@@ -15,7 +15,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-pub use store::{AppState, ApiStore, DataStoreKind, new_mock_store};
+pub use store::{ApiStore, AppState, DataStoreKind, new_mock_store};
 
 /// Build the full HTTP service graph (routes, auth middleware, Swagger UI).
 pub fn router(state: Arc<AppState>) -> Router {

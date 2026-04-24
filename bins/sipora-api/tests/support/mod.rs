@@ -16,10 +16,7 @@ pub fn mock_state(domain: &str, token: Option<&str>) -> Arc<AppState> {
     })
 }
 
-pub async fn text_response(
-    app: Router,
-    req: Request<Body>,
-) -> (StatusCode, String) {
+pub async fn text_response(app: Router, req: Request<Body>) -> (StatusCode, String) {
     let resp = app.clone().oneshot(req).await.expect("oneshot");
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 256 * 1024)

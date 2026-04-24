@@ -114,9 +114,7 @@ async fn postgres_ready_checks_database() {
         max_pool_size: 3,
         cdr_retention_months: 24,
     };
-    let pool = sipora_data::pg::connect_pool(&cfg)
-        .await
-        .expect("connect");
+    let pool = sipora_data::pg::connect_pool(&cfg).await.expect("connect");
     sipora_data::pg::verify_provisioning_schema(&pool)
         .await
         .expect("schema");
