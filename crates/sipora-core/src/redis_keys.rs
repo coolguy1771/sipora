@@ -13,6 +13,11 @@ pub fn register_transaction_ok_key(call_id: &str, cseq: u32) -> String {
     format!("register_tx_ok:{call_id}:{cseq}")
 }
 
+/// Short-lived lock so concurrent REGISTERs with the same Call-ID + CSeq do not double-upsert.
+pub fn register_commit_lock_key(call_id: &str, cseq: u32) -> String {
+    format!("register_lock:{call_id}:{cseq}")
+}
+
 pub fn location_key(domain: &str, user: &str) -> String {
     format!("{LOCATION_KEY_PREFIX}:{domain}:{user}")
 }

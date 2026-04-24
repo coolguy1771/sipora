@@ -1,10 +1,12 @@
 //! UDP registrar and request-only SIP handling. INVITE is forwarded without response relay;
 //! see `AGENTS.md` ("SIP signaling scope") and `docs/qualification.md` for end-to-end INVITE paths.
 
-use fred::prelude::{Expiration, KeysInterface};
+use fred::prelude::{Expiration, KeysInterface, SetOptions};
 use sipora_auth::digest::{DigestChallenge, DigestResponse, verify_digest};
 use sipora_core::redis::RedisPool;
-use sipora_core::redis_keys::{register_digest_nonce_key, register_transaction_ok_key};
+use sipora_core::redis_keys::{
+    register_commit_lock_key, register_digest_nonce_key, register_transaction_ok_key,
+};
 use sipora_data::pg::get_user_sip_digest_ha1;
 use sipora_location::ContactBinding;
 use sipora_location::redis_store::{list_contact_uris, upsert_contact};
@@ -245,21 +247,48 @@ async fn store_register_nonce(redis: &RedisPool, nonce: &str, ttl_s: u64) -> any
     Ok(())
 }
 
-async fn register_nonce_exists(redis: &RedisPool, nonce: &str) -> bool {
+async fn register_nonce_exists(redis: &RedisPool, nonce: &str) -> anyhow::Result<bool> {
     let key = register_digest_nonce_key(nonce);
-    let n: i64 = redis.exists(&key).await.unwrap_or(0);
-    n > 0
+    let n: i64 = redis.exists(&key).await?;
+    Ok(n > 0)
 }
 
-async fn invalidate_register_nonce(redis: &RedisPool, nonce: &str) {
+async fn invalidate_register_nonce(redis: &RedisPool, nonce: &str) -> anyhow::Result<()> {
     let key = register_digest_nonce_key(nonce);
-    let _: i64 = redis.del(&key).await.unwrap_or(0);
+    let _: i64 = redis.del(&key).await?;
+    Ok(())
 }
 
-async fn register_tx_ok_exists(redis: &RedisPool, call_id: &str, cseq: u32) -> bool {
+async fn register_tx_ok_exists(
+    redis: &RedisPool,
+    call_id: &str,
+    cseq: u32,
+) -> anyhow::Result<bool> {
     let key = register_transaction_ok_key(call_id, cseq);
-    let n: i64 = redis.exists(&key).await.unwrap_or(0);
-    n > 0
+    let n: i64 = redis.exists(&key).await?;
+    Ok(n > 0)
+}
+
+/// SET NX PX so only one REGISTER commit runs per Call-ID + CSeq.
+async fn try_register_commit_lock(redis: &RedisPool, lock_key: &str) -> anyhow::Result<bool> {
+    const LOCK_MS: i64 = 15_000;
+    let set: Option<String> = redis
+        .set(
+            lock_key,
+            "1",
+            Some(Expiration::PX(LOCK_MS)),
+            Some(SetOptions::NX),
+            false,
+        )
+        .await?;
+    Ok(set.is_some())
+}
+
+async fn release_register_commit_lock(redis: &RedisPool, lock_key: &str) {
+    let res: Result<i64, _> = redis.del(lock_key).await;
+    if let Err(e) = res {
+        tracing::warn!(%e, key = %lock_key, "register commit lock del");
+    }
 }
 
 async fn mark_register_tx_ok(redis: &RedisPool, call_id: &str, cseq: u32) -> anyhow::Result<()> {
@@ -407,6 +436,116 @@ fn register_call_id_cseq(req: &Request) -> Option<(&str, u32)> {
     (cs.method == Method::Register).then_some((call_id, cs.seq))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn register_digest_commit_after_lock(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    user: &str,
+    dom: &str,
+    binding: &ContactBinding,
+    expires: u32,
+    auth_raw: &str,
+    call_id: &str,
+    cseq_n: u32,
+) -> anyhow::Result<()> {
+    let Some(dr) = DigestResponse::parse(auth_raw) else {
+        respond(socket, peer, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    if !dr.username.eq_ignore_ascii_case(user) || !dr.realm.eq_ignore_ascii_case(dom) {
+        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        return Ok(());
+    }
+    match register_nonce_exists(redis, &dr.nonce).await {
+        Ok(false) => {
+            respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+            Ok(())
+        }
+        Ok(true) => {
+            register_commit_digest(
+                socket, redis, cfg, peer, req, dom, user, binding, expires, &dr, call_id, cseq_n,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(%e, "register redis (nonce exists)");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await;
+            Ok(())
+        }
+    }
+}
+
+/// `Ok(None)` if the request was fully answered (idempotent 200 or 503).
+/// `Ok(Some(lock_key))` if the caller holds the commit lock and must release it.
+async fn register_try_acquire_commit_lock(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    peer: SocketAddr,
+    req: &Request,
+    call_id: &str,
+    cseq_n: u32,
+) -> anyhow::Result<Option<String>> {
+    match register_tx_ok_exists(redis, call_id, cseq_n).await {
+        Ok(true) => {
+            respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+            return Ok(None);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(%e, "register redis (tx ok exists)");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await;
+            return Ok(None);
+        }
+    }
+
+    let lock_key = register_commit_lock_key(call_id, cseq_n);
+    let lock_ok = match try_register_commit_lock(redis, &lock_key).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%e, "register redis (commit lock)");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+    if !lock_ok {
+        match register_tx_ok_exists(redis, call_id, cseq_n).await {
+            Ok(_) => {
+                respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+            }
+            Err(e) => {
+                tracing::warn!(%e, "register redis (tx ok after lock miss)");
+                respond(
+                    socket,
+                    peer,
+                    &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+                )
+                .await;
+            }
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(lock_key))
+}
+
 #[allow(clippy::too_many_arguments)] // REGISTER digest + binding; refactor into a ctx struct if extended.
 async fn register_complete_digest(
     socket: &tokio::net::UdpSocket,
@@ -425,28 +564,19 @@ async fn register_complete_digest(
         return Ok(());
     };
 
-    if register_tx_ok_exists(redis, call_id, cseq_n).await {
-        respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
-        return Ok(());
-    }
+    let lock_key =
+        match register_try_acquire_commit_lock(socket, redis, peer, req, call_id, cseq_n).await? {
+            Some(k) => k,
+            None => return Ok(()),
+        };
 
-    let Some(dr) = DigestResponse::parse(auth_raw) else {
-        respond(socket, peer, &sip_response(req, StatusCode::BAD_REQUEST)).await;
-        return Ok(());
-    };
-    if dr.username != user || !dr.realm.eq_ignore_ascii_case(dom) {
-        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-        return Ok(());
-    }
-    if !register_nonce_exists(redis, &dr.nonce).await {
-        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-        return Ok(());
-    }
-
-    register_commit_digest(
-        socket, redis, cfg, peer, req, dom, user, binding, expires, &dr, call_id, cseq_n,
+    let commit_res = register_digest_commit_after_lock(
+        socket, redis, cfg, peer, req, user, dom, binding, expires, auth_raw, call_id, cseq_n,
     )
-    .await
+    .await;
+
+    release_register_commit_lock(redis, &lock_key).await;
+    commit_res
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -483,12 +613,16 @@ async fn register_commit_digest(
             realm = %dr.realm,
             "REGISTER digest: missing sip_digest_ha1 (migrate DB or POST /api/v1/users)"
         );
-        invalidate_register_nonce(redis, &dr.nonce).await;
+        if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
+            tracing::warn!(%e, "register invalidate nonce");
+        }
         respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
         return Ok(());
     };
     if !verify_digest(dr, &ha1, "REGISTER") {
-        invalidate_register_nonce(redis, &dr.nonce).await;
+        if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
+            tracing::warn!(%e, "register invalidate nonce");
+        }
         respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
         return Ok(());
     }
@@ -503,7 +637,16 @@ async fn register_commit_digest(
         .await;
         return Ok(());
     }
-    invalidate_register_nonce(redis, &dr.nonce).await;
+    if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
+        tracing::warn!(%e, "register invalidate nonce");
+        respond(
+            socket,
+            peer,
+            &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+        )
+        .await;
+        return Ok(());
+    }
     if let Err(e) = mark_register_tx_ok(redis, call_id, cseq_n).await {
         tracing::warn!(%e, "register tx ok marker");
     }

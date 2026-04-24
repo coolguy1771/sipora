@@ -54,9 +54,11 @@ pub async fn create_user(
     password: &str,
     enabled: bool,
 ) -> Result<UserSummary, DataError> {
+    let username = username.to_lowercase();
+    let domain = domain.to_lowercase();
     let hash = sipora_auth::digest::hash_password(password)
         .map_err(|e| DataError::Serialization(format!("password hash: {e}")))?;
-    let sip_digest_ha1 = sipora_auth::digest::compute_ha1(username, domain, password);
+    let sip_digest_ha1 = sipora_auth::digest::compute_ha1(&username, &domain, password);
     sqlx::query_as::<_, UserSummary>(
         r#"
         INSERT INTO users (username, domain, password_argon2, sip_digest_ha1, enabled)
@@ -64,8 +66,8 @@ pub async fn create_user(
         RETURNING id, username, domain, enabled, created_at
         "#,
     )
-    .bind(username)
-    .bind(domain)
+    .bind(&username)
+    .bind(&domain)
     .bind(&hash)
     .bind(&sip_digest_ha1)
     .bind(enabled)
