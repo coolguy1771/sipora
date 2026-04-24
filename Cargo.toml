@@ -90,7 +90,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Error handling
 thiserror = "2"
-anyhow = "1"
+anyhow = "1.0.102"
 
 # Utilities
 uuid = { version = "1.23", features = ["v4", "serde"] }
