@@ -5,19 +5,20 @@ Sipora is a Rust workspace for a SIP platform: libraries for SIP messaging, SDP,
 ## Requirements
 
 - Rust toolchain (edition 2024; stable with current `Cargo.lock`)
-- PostgreSQL and Redis for production-style deployments (see configuration)
-- Optional: Docker Compose under `tests/` for local Postgres, Redis, and Grafana stack (Mimir, Tempo, Loki, Alloy)
+- PostgreSQL 18 and Valkey 9 for production-style deployments (see configuration); client URLs still use the `redis://` scheme where applicable
+- Optional: Docker Compose under `tests/` for local Postgres, Valkey, and Grafana stack (Mimir, Tempo, Loki, Alloy)
 
 ## Build and test
 
 ```sh
 cargo build --workspace
 cargo test --workspace
+# `sipora-api` includes HTTP e2e tests (`tests/api_http_e2e.rs`); Postgres-backed API tests in `tests/api_postgres_e2e.rs` run when `DATABASE_URL` is set (see integration workflow).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI runs these checks on push and pull requests (see `.github/workflows/ci.yml`). Integration checks with Postgres and Redis run via `.github/workflows/integration.yml`. Release tags trigger `.github/workflows/release.yml`. See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASING.md](docs/RELEASING.md).
+CI runs these checks on push and pull requests (see `.github/workflows/ci.yml`). Integration checks with Postgres 18 and Valkey 9 run via `.github/workflows/integration.yml`. Release tags trigger `.github/workflows/release.yml`. See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Workspace layout
 

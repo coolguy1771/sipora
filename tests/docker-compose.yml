@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17
+    image: postgres:18
     environment:
       POSTGRES_DB: sipora_test
       POSTGRES_USER: sipora
@@ -13,13 +13,13 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    command: redis-server --cluster-enabled no
+  valkey:
+    image: valkey/valkey:9-alpine
+    command: valkey-server --cluster-enabled no
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 2s
       timeout: 5s
       retries: 10

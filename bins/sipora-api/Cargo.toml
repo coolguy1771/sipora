@@ -6,6 +6,9 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "sipora-api"
 path = "src/main.rs"
@@ -27,3 +30,7 @@ sipora-core = { workspace = true }
 sipora-data = { workspace = true }
 sipora-auth = { workspace = true }
 sipora-location = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+uuid = { workspace = true }

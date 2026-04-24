@@ -1,13 +1,13 @@
 # Integration qualification
 
-CI runs `cargo test --workspace` without external services. Use this checklist for Postgres, Redis, and SIP exercises before calling a release production-ready.
+CI runs `cargo test --workspace` without external services. Use this checklist for Postgres, Valkey (Redis-compatible), and SIP exercises before calling a release production-ready.
 
 ## 1. Local stack
 
 From the repository root:
 
 ```sh
-docker compose -f tests/docker-compose.yml up -d postgres redis
+docker compose -f tests/docker-compose.yml up -d postgres valkey
 ```
 
 Wait for health checks, then apply SQL migrations in lexical order:
@@ -17,7 +17,7 @@ export DATABASE_URL="postgres://sipora:test_only_not_production@127.0.0.1:5432/s
 cargo run -p sipora-migrate -- --database-url "$DATABASE_URL"
 ```
 
-Use the same `DATABASE_URL` pattern in `SIPORA__POSTGRES__URL` (or your config) for binaries that talk to PostgreSQL. Point Redis config at `redis://127.0.0.1:6379/0` (or the cluster URL your `sipora.toml` expects).
+Use the same `DATABASE_URL` pattern in `SIPORA__POSTGRES__URL` (or your config) for binaries that talk to PostgreSQL. Point `redis.nodes` at `redis://127.0.0.1:6379/0` (or the cluster URL your `sipora.toml` expects); Valkey speaks the Redis protocol, so `redis://` URLs remain correct.
 
 ## 2. Binaries
 
@@ -27,4 +27,4 @@ Use the same `DATABASE_URL` pattern in `SIPORA__POSTGRES__URL` (or your config) 
 
 ## 3. Automated integration job
 
-GitHub Actions workflow `.github/workflows/integration.yml` starts Postgres and Redis service containers, applies `migrations/*.sql`, and runs `cargo test --workspace`. It does not replace full SIP interop testing.
+GitHub Actions workflow `.github/workflows/integration.yml` starts PostgreSQL 18 and Valkey 9 service containers, applies `migrations/*.sql`, and runs `cargo test --workspace`. It does not replace full SIP interop testing.

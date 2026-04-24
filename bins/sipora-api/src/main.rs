@@ -1,19 +1,8 @@
-mod auth;
-mod openapi;
-mod routes;
-mod store;
-
 use anyhow::Result;
-use axum::Router;
-use axum::middleware;
-use axum::routing::get;
 use clap::Parser;
+use sipora_api::{router, store};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::set_header::SetResponseHeaderLayer;
-use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Parser)]
 #[command(name = "sipora-api", about = "SIP platform REST provisioning API")]
@@ -71,34 +60,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    const BODY_LIMIT: usize = 256 * 1024;
-
-    let app = Router::new()
-        .route("/health", get(routes::health))
-        .route("/ready", get(routes::ready))
-        .route(
-            "/api/v1/users",
-            get(routes::list_users).post(routes::create_user),
-        )
-        .route("/api/v1/users/{id}", get(routes::get_user))
-        .route("/api/v1/cdrs", get(routes::query_cdrs))
-        .merge(
-            SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_provisioning_auth,
-        ))
-        .layer(RequestBodyLimitLayer::new(BODY_LIMIT))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::X_CONTENT_TYPE_OPTIONS,
-            axum::http::HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::X_FRAME_OPTIONS,
-            axum::http::HeaderValue::from_static("DENY"),
-        ))
-        .with_state(state);
+    let app = router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     tracing::info!(%addr, "sipora-api listening");

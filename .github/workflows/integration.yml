@@ -10,12 +10,12 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  postgres-redis:
+  postgres-valkey:
     name: Migrations and tests
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17@sha256:5b96f1a16bd9768b060dd2ffe55cb6225c4d9ef4d214a8b21eb08134869a97e4
+        image: postgres:18@sha256:78481659c47e862334611ccdaf7c369c986b3046da9857112f3b309114a65fb4
         env:
           POSTGRES_USER: sipora
           POSTGRES_PASSWORD: test_only_not_production
@@ -27,12 +27,12 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 10
-      redis:
-        image: redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6
+      valkey:
+        image: valkey/valkey:9-alpine@sha256:e1095c6c76ee982cb2d1e07edbb7fb2a53606630a1d810d5a47c9f646b708bf5
         ports:
           - 6379:6379
         options: >-
-          --health-cmd "redis-cli ping"
+          --health-cmd "valkey-cli ping"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 10
@@ -49,4 +49,6 @@ jobs:
           DATABASE_URL: postgres://sipora:test_only_not_production@localhost:5432/sipora_test
         run: cargo run -p sipora-migrate -- --database-url "$DATABASE_URL"
       - name: Cargo test
+        env:
+          DATABASE_URL: postgres://sipora:test_only_not_production@localhost:5432/sipora_test
         run: cargo test --workspace

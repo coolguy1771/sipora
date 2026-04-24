@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `sipora-b2bua` is part of the v1 GA surface per `docs/stability.md`; startup requires `[b2bua].downstream`.
+- Integration workflow and `tests/docker-compose.yml`: PostgreSQL 18 and Valkey 9 (replacing Postgres 17 and Redis 7).
 
 ## [0.1.0] - TBD
 
