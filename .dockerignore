@@ -1,0 +1,16 @@
+# Whitelist: exclude the whole context, then re-include only paths needed for
+# `cargo build --release` (workspace root, crates, bins, embedded migrations).
+
+**
+
+!/Cargo.toml
+!/Cargo.lock
+
+!/crates/
+!/crates/**
+
+!/bins/
+!/bins/**
+
+!/migrations/
+!/migrations/**

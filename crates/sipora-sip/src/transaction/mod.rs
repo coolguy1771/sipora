@@ -1,3 +1,9 @@
+//! SIP transaction helpers (timers, client/server invite and non-invite stubs).
+//!
+//! **Scope:** This module is not integrated into `sipora-proxy`, `sipora-edge`, or other
+//! application binaries. Do not treat it as production RFC 3261 / RFC 6026 behavior until
+//! it is wired, tested, and documented on a specific signaling path. See `AGENTS.md`.
+
 pub mod client_invite;
 pub mod client_non_invite;
 pub mod manager;

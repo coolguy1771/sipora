@@ -41,9 +41,16 @@ async fn main() -> Result<()> {
         let _ = serve_health(health_addr, rh, shutdown_health).await;
     });
 
-    let pool = sipora_core::redis::connect_pool(&config.redis)
+    let redis = sipora_core::redis::connect_pool(&config.redis)
         .await
         .map_err(|e| anyhow::anyhow!("redis: {e}"))?;
+
+    let pg = sipora_data::pg::connect_pool(&config.postgres)
+        .await
+        .map_err(|e| anyhow::anyhow!("postgres: {e}"))?;
+    sipora_data::pg::verify_provisioning_schema(&pg)
+        .await
+        .map_err(|e| anyhow::anyhow!("postgres schema: {e}"))?;
 
     let sip_addr = SocketAddr::from(([0, 0, 0, 0], config.general.sip_udp_port));
     let mf = config.proxy.max_forwards;
@@ -57,6 +64,7 @@ async fn main() -> Result<()> {
     let min_exp = config.registrar.min_expires;
     let max_exp = config.registrar.max_expires;
     let def_exp = config.registrar.default_expires;
+    let nonce_ttl = config.registrar.nonce_ttl_s;
     let udp_cfg = udp::UdpProxyConfig {
         domain: domain_cfg,
         advertise,
@@ -67,9 +75,11 @@ async fn main() -> Result<()> {
             max_expires: max_exp,
             default_expires: def_exp,
         },
+        nonce_ttl_s: nonce_ttl,
+        pg,
     };
     tokio::spawn(async move {
-        if let Err(e) = udp::run_udp_proxy(sip_addr, pool, udp_cfg, shutdown_rx).await {
+        if let Err(e) = udp::run_udp_proxy(sip_addr, redis, udp_cfg, shutdown_rx).await {
             tracing::error!("udp proxy: {e}");
         }
     });

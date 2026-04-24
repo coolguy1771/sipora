@@ -127,16 +127,17 @@ pub fn verify_digest(resp: &DigestResponse, ha1: &str, method: &str) -> bool {
         _ => compute_response_no_qop(ha1, &resp.nonce, &ha2),
     };
 
-    constant_time_eq(expected.as_bytes(), resp.response.as_bytes())
+    constant_time_eq_hex(expected.as_str(), resp.response.as_str())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Hex MD5 digest compare (many UAs send A-F uppercase; we emit lowercase).
+fn constant_time_eq_hex(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
     }
     diff == 0
 }
@@ -168,6 +169,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dev_alice_lab_ha1_matches_migration_backfill() {
+        let ha1 = compute_ha1("alice", "sip.example.com", "change-me");
+        assert_eq!(ha1, "2e87c19c08f69108e07e07c89893d5a5");
+    }
+
+    #[test]
     fn test_digest_computation() {
         let ha1 = compute_ha1("alice", "example.com", "password123");
         let ha2 = compute_ha2("REGISTER", "sip:example.com");
@@ -177,10 +184,42 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"ab", b"abc"));
+    fn test_constant_time_eq_hex() {
+        assert!(constant_time_eq_hex("aBc123", "AbC123"));
+        assert!(!constant_time_eq_hex("abc", "abd"));
+        assert!(!constant_time_eq_hex("ab", "abc"));
+    }
+
+    #[test]
+    fn verify_digest_accepts_uppercase_response_hex() {
+        let ha1 = compute_ha1("alice", "sip.example.com", "change-me");
+        let nonce = "n1";
+        let uri = "sip:sip.example.com";
+        let ha2 = compute_ha2("REGISTER", uri);
+        let resp_hex = compute_response_no_qop(&ha1, nonce, &ha2);
+        let upper = resp_hex.to_ascii_uppercase();
+        let hdr = format!(
+            r#"Digest username="alice", realm="sip.example.com", nonce="{nonce}", uri="{uri}", response="{upper}""#
+        );
+        let dr = DigestResponse::parse(&hdr).expect("parse");
+        assert!(verify_digest(&dr, &ha1, "REGISTER"));
+    }
+
+    #[test]
+    fn verify_digest_with_qop_auth_roundtrip() {
+        let ha1 = compute_ha1("alice", "sip.example.com", "change-me");
+        let nonce = "nonce123";
+        let uri = "sip:sip.example.com";
+        let ha2 = compute_ha2("REGISTER", uri);
+        let nc = "00000001";
+        let cnonce = "cval";
+        let qop = "auth";
+        let response = compute_response(&ha1, nonce, nc, cnonce, qop, &ha2);
+        let hdr = format!(
+            r#"Digest username="alice", realm="sip.example.com", nonce="{nonce}", uri="{uri}", response="{response}", nc={nc}, cnonce="{cnonce}", qop="{qop}""#
+        );
+        let dr = DigestResponse::parse(&hdr).expect("parse");
+        assert!(verify_digest(&dr, &ha1, "REGISTER"));
     }
 
     #[test]

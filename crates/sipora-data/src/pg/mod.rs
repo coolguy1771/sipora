@@ -8,7 +8,7 @@ pub use cdr_insert::insert_cdr;
 pub use cdr_query::{CdrSearchParams, search_cdrs};
 pub use pool::connect_pool;
 pub use schema_check::verify_provisioning_schema;
-pub use users::{UserSummary, create_user, get_user_by_id, list_users};
+pub use users::{UserSummary, create_user, get_user_by_id, get_user_sip_digest_ha1, list_users};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -31,8 +31,10 @@ pub struct B2buaConfig {
 
 impl Default for B2buaConfig {
     fn default() -> Self {
+        // Must not equal `general.sip_udp_port` (5060): forwarding INVITE to the same
+        // UDP port loops back into this process and breaks SIPp/clients (unexpected INVITE).
         Self {
-            downstream: Some("127.0.0.1:5060".into()),
+            downstream: Some("127.0.0.1:5070".into()),
         }
     }
 }

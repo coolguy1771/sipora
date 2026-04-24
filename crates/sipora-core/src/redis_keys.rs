@@ -3,6 +3,16 @@ pub const NONCE_KEY_PREFIX: &str = "nonce";
 pub const RATELIMIT_KEY_PREFIX: &str = "ratelimit";
 pub const SESSION_KEY_PREFIX: &str = "session";
 
+/// One-time REGISTER digest challenge nonce (see sipora-proxy).
+pub fn register_digest_nonce_key(nonce: &str) -> String {
+    format!("register_digest:{nonce}")
+}
+
+/// Completed REGISTER (Call-ID + CSeq) for UDP idempotent 200 retransmits.
+pub fn register_transaction_ok_key(call_id: &str, cseq: u32) -> String {
+    format!("register_tx_ok:{call_id}:{cseq}")
+}
+
 pub fn location_key(domain: &str, user: &str) -> String {
     format!("{LOCATION_KEY_PREFIX}:{domain}:{user}")
 }

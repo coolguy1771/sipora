@@ -1,4 +1,11 @@
+//! UDP registrar and request-only SIP handling. INVITE is forwarded without response relay;
+//! see `AGENTS.md` ("SIP signaling scope") and `docs/qualification.md` for end-to-end INVITE paths.
+
+use fred::prelude::{Expiration, KeysInterface};
+use sipora_auth::digest::{DigestChallenge, DigestResponse, verify_digest};
 use sipora_core::redis::RedisPool;
+use sipora_core::redis_keys::{register_digest_nonce_key, register_transaction_ok_key};
+use sipora_data::pg::get_user_sip_digest_ha1;
 use sipora_location::ContactBinding;
 use sipora_location::redis_store::{list_contact_uris, upsert_contact};
 use sipora_sip::parser::message::parse_sip_message;
@@ -8,6 +15,7 @@ use sipora_sip::types::message::{Request, Response, SipMessage, SipVersion};
 use sipora_sip::types::method::Method;
 use sipora_sip::types::status::StatusCode;
 use sipora_transport::udp::UdpTransport;
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -28,11 +36,13 @@ pub struct UdpProxyConfig {
     pub sip_port: u16,
     pub max_forwards: u8,
     pub registrar: RegistrarLimits,
+    pub nonce_ttl_s: u64,
+    pub pg: PgPool,
 }
 
 pub async fn run_udp_proxy(
     addr: SocketAddr,
-    pool: RedisPool,
+    redis: RedisPool,
     cfg: UdpProxyConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -58,7 +68,7 @@ pub async fn run_udp_proxy(
                 };
                 if let Err(e) = dispatch_request(
                     &socket,
-                    &pool,
+                    &redis,
                     &router,
                     &cfg,
                     peer,
@@ -75,15 +85,24 @@ pub async fn run_udp_proxy(
 
 async fn dispatch_request(
     socket: &tokio::net::UdpSocket,
-    pool: &RedisPool,
+    redis: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
     peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<()> {
     match req.method {
-        Method::Invite => handle_invite(socket, pool, router, cfg, peer, req).await,
-        Method::Register => handle_register(socket, pool, cfg, peer, req).await,
+        Method::Invite => handle_invite(socket, redis, router, cfg, peer, req).await,
+        Method::Register => handle_register(socket, redis, cfg, peer, req).await,
+        Method::Bye | Method::Cancel => {
+            respond(socket, peer, &sip_response(&req, StatusCode::OK)).await;
+            Ok(())
+        }
+        Method::Options => {
+            respond(socket, peer, &sip_options_ok(&req)).await;
+            Ok(())
+        }
+        Method::Ack => Ok(()),
         _ => {
             respond(
                 socket,
@@ -202,9 +221,112 @@ fn normalize_domain(dom: String, fallback: &str) -> String {
     }
 }
 
+fn register_authorization_value(req: &Request) -> Option<&str> {
+    let raw = req.headers.iter().find_map(|h| match h {
+        Header::Authorization(v) => Some(v.as_str()),
+        Header::ProxyAuthorization(v) => Some(v.as_str()),
+        Header::Extension { name, value } if name.eq_ignore_ascii_case("authorization") => {
+            Some(value.as_str())
+        }
+        Header::Extension { name, value } if name.eq_ignore_ascii_case("proxy-authorization") => {
+            Some(value.as_str())
+        }
+        _ => None,
+    });
+    raw.filter(|s| !s.trim().is_empty())
+}
+
+async fn store_register_nonce(redis: &RedisPool, nonce: &str, ttl_s: u64) -> anyhow::Result<()> {
+    let key = register_digest_nonce_key(nonce);
+    let ttl = ttl_s.max(1) as i64;
+    let _: Option<String> = redis
+        .set(&key, "1", Some(Expiration::EX(ttl)), None, false)
+        .await?;
+    Ok(())
+}
+
+async fn register_nonce_exists(redis: &RedisPool, nonce: &str) -> bool {
+    let key = register_digest_nonce_key(nonce);
+    let n: i64 = redis.exists(&key).await.unwrap_or(0);
+    n > 0
+}
+
+async fn invalidate_register_nonce(redis: &RedisPool, nonce: &str) {
+    let key = register_digest_nonce_key(nonce);
+    let _: i64 = redis.del(&key).await.unwrap_or(0);
+}
+
+async fn register_tx_ok_exists(redis: &RedisPool, call_id: &str, cseq: u32) -> bool {
+    let key = register_transaction_ok_key(call_id, cseq);
+    let n: i64 = redis.exists(&key).await.unwrap_or(0);
+    n > 0
+}
+
+async fn mark_register_tx_ok(redis: &RedisPool, call_id: &str, cseq: u32) -> anyhow::Result<()> {
+    let key = register_transaction_ok_key(call_id, cseq);
+    let ttl: i64 = 70;
+    let _: Option<String> = redis
+        .set(&key, "1", Some(Expiration::EX(ttl)), None, false)
+        .await?;
+    Ok(())
+}
+
+fn sip_options_ok(req: &Request) -> SipMessage {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            _ => {}
+        }
+    }
+    headers.push(Header::Allow(vec![
+        Method::Invite,
+        Method::Ack,
+        Method::Bye,
+        Method::Cancel,
+        Method::Register,
+        Method::Options,
+    ]));
+    headers.push(Header::ContentLength(0));
+    SipMessage::Response(Response {
+        version: SipVersion::V2_0,
+        status: StatusCode::OK,
+        reason: StatusCode::OK.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
+fn sip_response_www_auth(req: &Request, www: &str) -> SipMessage {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            _ => {}
+        }
+    }
+    headers.push(Header::WwwAuthenticate(www.to_owned()));
+    headers.push(Header::ContentLength(0));
+    SipMessage::Response(Response {
+        version: SipVersion::V2_0,
+        status: StatusCode::UNAUTHORIZED,
+        reason: StatusCode::UNAUTHORIZED.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
 async fn handle_register(
     socket: &tokio::net::UdpSocket,
-    pool: &RedisPool,
+    redis: &RedisPool,
     cfg: &UdpProxyConfig,
     peer: SocketAddr,
     req: Request,
@@ -213,7 +335,7 @@ async fn handle_register(
         respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
-    let Some((user, dom)) = parse_sip_user_host(&to.uri) else {
+    let Some((user, dom_raw)) = parse_sip_user_host(&to.uri) else {
         respond(
             socket,
             peer,
@@ -222,7 +344,7 @@ async fn handle_register(
         .await;
         return Ok(());
     };
-    let dom = normalize_domain(dom, &cfg.domain);
+    let dom = normalize_domain(dom_raw, &cfg.domain);
     let contacts = req.contacts();
     let Some(contact) = contacts.first() else {
         respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
@@ -238,17 +360,154 @@ async fn handle_register(
         q_value: contact.q_value(),
         expires,
     };
-    if let Err(e) = upsert_contact(pool, &dom, &user, &binding, expires as i64).await {
-        tracing::warn!(%e, "register upsert");
+
+    match register_authorization_value(&req) {
+        None => register_send_digest_challenge(socket, redis, cfg, peer, &req, &dom).await,
+        Some(auth_raw) => {
+            register_complete_digest(
+                socket, redis, cfg, peer, &req, &user, &dom, &binding, expires, auth_raw,
+            )
+            .await
+        }
+    }
+}
+
+async fn register_send_digest_challenge(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    realm: &str,
+) -> anyhow::Result<()> {
+    let nonce = Uuid::new_v4().simple().to_string();
+    if let Err(e) = store_register_nonce(redis, &nonce, cfg.nonce_ttl_s).await {
+        tracing::warn!(%e, "register nonce");
         respond(
             socket,
             peer,
-            &sip_response(&req, StatusCode::SERVER_INTERNAL_ERROR),
+            &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
         )
         .await;
         return Ok(());
     }
-    respond(socket, peer, &SipMessage::Response(simple_ok(&req))).await;
+    let ch = DigestChallenge::new(realm, &nonce);
+    respond(
+        socket,
+        peer,
+        &sip_response_www_auth(req, &ch.to_www_authenticate()),
+    )
+    .await;
+    Ok(())
+}
+
+fn register_call_id_cseq(req: &Request) -> Option<(&str, u32)> {
+    let call_id = req.call_id()?;
+    let cs = req.cseq()?;
+    (cs.method == Method::Register).then_some((call_id, cs.seq))
+}
+
+#[allow(clippy::too_many_arguments)] // REGISTER digest + binding; refactor into a ctx struct if extended.
+async fn register_complete_digest(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    user: &str,
+    dom: &str,
+    binding: &ContactBinding,
+    expires: u32,
+    auth_raw: &str,
+) -> anyhow::Result<()> {
+    let Some((call_id, cseq_n)) = register_call_id_cseq(req) else {
+        respond(socket, peer, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+
+    if register_tx_ok_exists(redis, call_id, cseq_n).await {
+        respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+        return Ok(());
+    }
+
+    let Some(dr) = DigestResponse::parse(auth_raw) else {
+        respond(socket, peer, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    if dr.username != user || !dr.realm.eq_ignore_ascii_case(dom) {
+        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        return Ok(());
+    }
+    if !register_nonce_exists(redis, &dr.nonce).await {
+        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        return Ok(());
+    }
+
+    register_commit_digest(
+        socket, redis, cfg, peer, req, dom, user, binding, expires, &dr, call_id, cseq_n,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_commit_digest(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    dom: &str,
+    user: &str,
+    binding: &ContactBinding,
+    expires: u32,
+    dr: &DigestResponse,
+    call_id: &str,
+    cseq_n: u32,
+) -> anyhow::Result<()> {
+    let ha1 = match get_user_sip_digest_ha1(&cfg.pg, &dr.username, dom).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(%e, "register db");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let Some(ha1) = ha1 else {
+        tracing::warn!(
+            username = %dr.username,
+            realm = %dr.realm,
+            "REGISTER digest: missing sip_digest_ha1 (migrate DB or POST /api/v1/users)"
+        );
+        invalidate_register_nonce(redis, &dr.nonce).await;
+        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        return Ok(());
+    };
+    if !verify_digest(dr, &ha1, "REGISTER") {
+        invalidate_register_nonce(redis, &dr.nonce).await;
+        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        return Ok(());
+    }
+
+    if let Err(e) = upsert_contact(redis, dom, user, binding, expires as i64).await {
+        tracing::warn!(%e, "register upsert");
+        respond(
+            socket,
+            peer,
+            &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+        )
+        .await;
+        return Ok(());
+    }
+    invalidate_register_nonce(redis, &dr.nonce).await;
+    if let Err(e) = mark_register_tx_ok(redis, call_id, cseq_n).await {
+        tracing::warn!(%e, "register tx ok marker");
+    }
+    respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
     Ok(())
 }
 

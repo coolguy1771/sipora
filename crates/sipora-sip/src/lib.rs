@@ -1,3 +1,6 @@
+//! SIP message types, parsing, serialization, dialog helpers, and **experimental** transaction
+//! scaffolding (`transaction` is not used by shipping binaries; see that module and `AGENTS.md`).
+
 pub mod dialog;
 pub mod parser;
 pub mod serialize;
