@@ -31,8 +31,8 @@ use crate::dialog::{
     DialogState, DialogTable, dialog_for_request, insert_dialog_from_response, remove_dialog,
 };
 use crate::forward_table::{
-    ForwardTable, PendingForward, get_pending_forward, insert_forward, prepare_response,
-    spawn_forward_sweeper,
+    ForwardTable, PendingForward, find_branch_by_call_id, get_pending_forward, insert_forward,
+    prepare_response, spawn_forward_sweeper,
 };
 use crate::routing::ProxyRouter;
 
@@ -163,10 +163,7 @@ async fn dispatch_request(
             )
             .await
         }
-        Method::Cancel => {
-            respond(socket, peer, &sip_response(&req, StatusCode::OK)).await;
-            Ok(())
-        }
+        Method::Cancel => handle_cancel(socket, cfg, forward_table, peer, req).await,
         Method::Options => {
             respond(socket, peer, &sip_options_ok(&req)).await;
             Ok(())
@@ -477,7 +474,7 @@ async fn forward_dialog_request(
     if req.method != Method::Ack {
         track_client_transaction(transaction_table, &req, TransactionType::ClientNonInvite).await;
         let vias = collect_via_stack(&req.headers);
-        insert_forward(forward_table, branch, peer, target, vias, None, vec![]).await;
+        insert_forward(forward_table, branch, peer, target, vias, None, vec![], req.uri.clone()).await;
     }
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
@@ -610,6 +607,7 @@ async fn forward_invite_request(
         original_via_stack,
         original_request,
         remaining_targets,
+        req.uri.clone(),
     )
     .await;
     let bytes = serialize_message(&SipMessage::Request(req));
@@ -799,6 +797,77 @@ fn sip_response_www_auth(req: &Request, www: &str) -> SipMessage {
         headers,
         body: Vec::new(),
     })
+}
+
+async fn handle_cancel(
+    socket: &tokio::net::UdpSocket,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    peer: SocketAddr,
+    req: Request,
+) -> anyhow::Result<()> {
+    // RFC 3261 §16.10: respond 200 OK immediately, then forward CANCEL downstream.
+    respond(socket, peer, &sip_response(&req, StatusCode::OK)).await;
+    let Some(call_id) = req.call_id() else {
+        return Ok(());
+    };
+    let Some(branch) = find_branch_by_call_id(forward_table, call_id).await else {
+        return Ok(());
+    };
+    let pending_info = {
+        let table = forward_table.read().await;
+        table
+            .get(&branch)
+            .map(|p| (p.target_addr, p.forwarded_uri.clone()))
+    };
+    let Some((target_addr, forwarded_uri)) = pending_info else {
+        return Ok(());
+    };
+    // Forward CANCEL toward the callee. Keep the ForwardTable entry so the
+    // 487 response the callee sends back is relayed to the caller normally.
+    let cancel = build_cancel_request(&req, &branch, &forwarded_uri, cfg);
+    let bytes = serialize_message(&SipMessage::Request(cancel));
+    socket.send_to(&bytes, target_addr).await?;
+    Ok(())
+}
+
+fn build_cancel_request(
+    req: &Request,
+    proxy_branch: &str,
+    forwarded_uri: &str,
+    cfg: &UdpProxyConfig,
+) -> Request {
+    use sipora_sip::types::header::CSeq;
+    // RFC 3261 §9.1: CANCEL must copy From, To, Call-ID and CSeq-number (method → CANCEL).
+    // Top Via must match the Via inserted for the forwarded INVITE (same branch).
+    let mut headers = vec![Header::Via(Via {
+        transport: Transport::Udp,
+        host: cfg.advertise.clone(),
+        port: Some(cfg.sip_port),
+        branch: proxy_branch.to_string(),
+        received: None,
+        rport: sipora_sip::types::header::RportParam::Absent,
+        params: vec![],
+    })];
+    for h in &req.headers {
+        match h {
+            Header::From(_) | Header::To(_) | Header::CallId(_) => headers.push(h.clone()),
+            Header::CSeq(cseq) => headers.push(Header::CSeq(CSeq {
+                seq: cseq.seq,
+                method: Method::Cancel,
+            })),
+            _ => {}
+        }
+    }
+    headers.push(Header::MaxForwards(70));
+    headers.push(Header::ContentLength(0));
+    Request {
+        method: Method::Cancel,
+        uri: forwarded_uri.to_string(),
+        version: SipVersion::V2_0,
+        headers,
+        body: Vec::new(),
+    }
 }
 
 async fn handle_register(
@@ -1332,6 +1401,7 @@ mod tests {
             original_via_stack: vec![],
             original_request: Some(invite_request()),
             remaining_targets: vec![format!("sip:bob@{target_addr}")],
+            forwarded_uri: format!("sip:bob@{target_addr}"),
             final_forwarded: false,
             inserted_at: Instant::now(),
         };

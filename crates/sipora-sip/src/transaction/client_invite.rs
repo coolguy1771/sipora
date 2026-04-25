@@ -1,4 +1,4 @@
-use super::TransactionState;
+use super::{TIMER_T1, TIMER_T2, TransactionState};
 use crate::types::message::{Request, Response};
 use tokio::sync::mpsc;
 
@@ -105,6 +105,25 @@ impl ClientInviteTransaction {
     pub fn is_terminated(&self) -> bool {
         self.state == TransactionState::Terminated
     }
+
+    /// Spawns the RFC 3261 §17.1.1.2 Timer A retransmit loop.
+    ///
+    /// Fires `TimerAFired` on `event_tx` at T1, 2×T1, 4×T1, … (capped at T2).
+    /// The task exits when `event_tx` is closed (i.e., the transaction is gone).
+    /// Callers are responsible for aborting the returned handle when a response
+    /// arrives (transaction leaves the Calling state).
+    pub fn spawn_timer_a(event_tx: mpsc::Sender<ClientInviteEvent>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut delay = TIMER_T1;
+            loop {
+                tokio::time::sleep(delay).await;
+                if event_tx.send(ClientInviteEvent::TimerAFired).await.is_err() {
+                    return;
+                }
+                delay = (delay * 2).min(TIMER_T2);
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +188,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_timer_a_stops_when_channel_is_dropped() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let handle = ClientInviteTransaction::spawn_timer_a(event_tx);
+        drop(event_rx);
+        // After the channel receiver is dropped the task should exit cleanly.
+        let _ = tokio::time::timeout(
+            super::TIMER_T1 * 3,
+            handle,
+        )
+        .await;
+    }
+
+#[tokio::test]
     async fn timer_a_does_not_retransmit_after_provisional_response() {
         let (response_tx, _response_rx) = mpsc::channel(1);
         let (retransmit_tx, mut retransmit_rx) = mpsc::channel(1);

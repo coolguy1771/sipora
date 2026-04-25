@@ -15,6 +15,8 @@ pub struct PendingForward {
     pub original_via_stack: Vec<Via>,
     pub original_request: Option<Request>,
     pub remaining_targets: Vec<String>,
+    /// Request-URI used in the forwarded request — needed to build a downstream CANCEL.
+    pub forwarded_uri: String,
     pub final_forwarded: bool,
     pub inserted_at: Instant,
 }
@@ -28,6 +30,18 @@ pub fn new_forward_table() -> ForwardTable {
 /// Inserts a pending forward for `branch`.
 ///
 /// Returns the previous [`PendingForward`] when `branch` already existed (overwrite).
+pub async fn find_branch_by_call_id(table: &ForwardTable, call_id: &str) -> Option<String> {
+    table.read().await.iter().find_map(|(branch, pending)| {
+        pending
+            .original_request
+            .as_ref()
+            .and_then(|req| req.call_id())
+            .filter(|id| *id == call_id)
+            .map(|_| branch.clone())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_forward(
     table: &ForwardTable,
     branch: String,
@@ -36,6 +50,7 @@ pub async fn insert_forward(
     original_via_stack: Vec<Via>,
     original_request: Option<Request>,
     remaining_targets: Vec<String>,
+    forwarded_uri: String,
 ) -> Option<PendingForward> {
     let pending = PendingForward {
         client_addr,
@@ -43,6 +58,7 @@ pub async fn insert_forward(
         original_via_stack,
         original_request,
         remaining_targets,
+        forwarded_uri,
         final_forwarded: false,
         inserted_at: Instant::now(),
     };
@@ -134,11 +150,36 @@ fn restore_original_via_stack(response: &mut Response, original_vias: &[Via]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sipora_sip::types::header::{CSeq, NameAddr, RportParam, Transport};
+    use sipora_sip::types::header::{CSeq, Header, NameAddr, RportParam, Transport};
     use sipora_sip::types::message::SipVersion;
     use sipora_sip::types::method::Method;
     use sipora_sip::types::status::StatusCode;
     use std::time::Duration;
+
+    fn invite_request_with_call_id(call_id: &str) -> Request {
+        Request {
+            method: Method::Invite,
+            uri: "sip:bob@example.com".to_owned(),
+            version: SipVersion::V2_0,
+            headers: vec![
+                Header::Via(Via {
+                    transport: Transport::Udp,
+                    host: "client.example.com".to_owned(),
+                    port: Some(5060),
+                    branch: "z9hG4bK-client".to_owned(),
+                    received: None,
+                    rport: RportParam::Absent,
+                    params: vec![],
+                }),
+                Header::CallId(call_id.to_owned()),
+                Header::CSeq(CSeq {
+                    seq: 1,
+                    method: Method::Invite,
+                }),
+            ],
+            body: vec![],
+        }
+    }
 
     fn via(host: &str, branch: &str) -> Via {
         Via {
@@ -194,6 +235,7 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         let mut response = response(StatusCode::OK);
@@ -217,6 +259,7 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         let mut first = response(StatusCode::OK);
@@ -240,6 +283,7 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         let mut response = response(StatusCode::BUSY_HERE);
@@ -291,6 +335,7 @@ mod tests {
             vec![],
             None,
             vec!["sip:bob@backup.example.com".to_owned()],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         let mut resp = response(StatusCode::MOVED_TEMPORARILY);
@@ -317,6 +362,7 @@ mod tests {
             stack,
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         let mut resp = response_one_via(StatusCode::OK);
@@ -345,6 +391,7 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         let mut resp = response(StatusCode::RINGING);
@@ -367,6 +414,7 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         {
@@ -382,6 +430,7 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
 
@@ -406,6 +455,7 @@ mod tests {
                 vec![],
                 None,
                 vec![],
+                "sip:bob@127.0.0.1:5060".to_owned(),
             )
             .await
             .is_none()
@@ -418,9 +468,44 @@ mod tests {
             vec![],
             None,
             vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
         )
         .await;
         assert_eq!(prev.map(|p| p.target_addr), Some(client_addr));
         assert_eq!(table.read().await["same-branch"].target_addr, other);
+    }
+
+    #[tokio::test]
+    async fn find_branch_by_call_id_returns_matching_branch() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy-1".to_owned(),
+            client_addr,
+            client_addr,
+            vec![],
+            Some(invite_request_with_call_id("call-abc")),
+            vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
+        )
+        .await;
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy-2".to_owned(),
+            client_addr,
+            client_addr,
+            vec![],
+            Some(invite_request_with_call_id("call-xyz")),
+            vec![],
+            "sip:bob@127.0.0.1:5061".to_owned(),
+        )
+        .await;
+
+        let branch = find_branch_by_call_id(&table, "call-abc").await;
+        assert_eq!(branch.as_deref(), Some("z9hG4bK-proxy-1"));
+
+        let missing = find_branch_by_call_id(&table, "call-unknown").await;
+        assert!(missing.is_none());
     }
 }
