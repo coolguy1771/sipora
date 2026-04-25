@@ -12,6 +12,7 @@ pub enum TransactionType {
 pub struct TransactionEntry {
     pub key: TransactionKey,
     pub tx_type: TransactionType,
+    pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 pub struct TransactionManager {
@@ -29,6 +30,21 @@ impl TransactionManager {
         let entry = TransactionEntry {
             key: key.clone(),
             tx_type,
+            abort_handle: None,
+        };
+        self.transactions.insert(key, entry);
+    }
+
+    pub fn insert_with_timer(
+        &mut self,
+        key: TransactionKey,
+        tx_type: TransactionType,
+        abort_handle: tokio::task::AbortHandle,
+    ) {
+        let entry = TransactionEntry {
+            key: key.clone(),
+            tx_type,
+            abort_handle: Some(abort_handle),
         };
         self.transactions.insert(key, entry);
     }
@@ -38,7 +54,11 @@ impl TransactionManager {
     }
 
     pub fn remove(&mut self, key: &TransactionKey) -> Option<TransactionEntry> {
-        self.transactions.remove(key)
+        let entry = self.transactions.remove(key)?;
+        if let Some(handle) = &entry.abort_handle {
+            handle.abort();
+        }
+        Some(entry)
     }
 
     pub fn has_transaction(&self, key: &TransactionKey) -> bool {

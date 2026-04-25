@@ -86,6 +86,22 @@ fn serialize_header_value(header: &Header, buf: &mut Vec<u8>) {
         Header::Supported(vals) | Header::Require(vals) => {
             buf.extend_from_slice(vals.join(", ").as_bytes());
         }
+        Header::RSeq(n) => buf.extend_from_slice(n.to_string().as_bytes()),
+        Header::RAck { rseq, cseq, method } => {
+            buf.extend_from_slice(rseq.to_string().as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(cseq.to_string().as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(method.as_str().as_bytes());
+        }
+        Header::SessionExpires { delta_seconds, refresher } => {
+            buf.extend_from_slice(delta_seconds.to_string().as_bytes());
+            if let Some(r) = refresher {
+                buf.extend_from_slice(b";refresher=");
+                buf.extend_from_slice(r.as_str().as_bytes());
+            }
+        }
+        Header::MinSE(n) => buf.extend_from_slice(n.to_string().as_bytes()),
         Header::Extension { value, .. } => {
             buf.extend_from_slice(value.as_bytes());
         }

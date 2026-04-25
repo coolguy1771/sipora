@@ -10,9 +10,11 @@
 use moka::sync::Cache;
 use sipora_sip::types::header::Header;
 use sipora_sip::types::message::{Request, Response};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// Max dialog rows kept in memory before LRU eviction.
 pub const DEFAULT_DIALOG_TABLE_MAX_ENTRIES: u64 = 50_000;
@@ -60,6 +62,37 @@ pub fn new_dialog_table() -> DialogTable {
     )
 }
 
+/// Per-dialog session-timer guard handles: aborted on BYE or re-INVITE.
+pub type RefreshTable = Arc<Mutex<HashMap<DialogKey, tokio::task::AbortHandle>>>;
+
+pub fn new_refresh_table() -> RefreshTable {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Spawns a guard that removes the dialog after `session_expires` seconds if no refresh arrives.
+pub async fn spawn_session_guard(
+    dialog_table: &DialogTable,
+    refresh_table: &RefreshTable,
+    key: DialogKey,
+    session_expires: u32,
+) {
+    let dialog_table = Arc::clone(dialog_table);
+    let key_for_task = key.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(session_expires as u64)).await;
+        tracing::warn!(call_id = %key_for_task.call_id, "session timer expired — removing zombie dialog");
+        dialog_table.invalidate(&key_for_task);
+    });
+    refresh_table.lock().await.insert(key, handle.abort_handle());
+}
+
+/// Cancels any running session guard for the given dialog (called on BYE).
+pub async fn cancel_session_guard(refresh_table: &RefreshTable, key: &DialogKey) {
+    if let Some(handle) = refresh_table.lock().await.remove(key) {
+        handle.abort();
+    }
+}
+
 /// Drops a dialog after successful BYE handling or administrative cleanup.
 pub fn remove_dialog(table: &DialogTable, dialog_key: &DialogKey) {
     table.invalidate(dialog_key);
@@ -72,13 +105,17 @@ pub async fn insert_dialog_from_response(
     callee_addr: SocketAddr,
 ) -> Option<DialogKey> {
     let key = response_dialog_key(response)?;
+    let session_expires = response.headers.iter().find_map(|h| match h {
+        Header::SessionExpires { delta_seconds, .. } => Some(*delta_seconds),
+        _ => None,
+    });
     let state = DialogState {
         route_set: response_route_set(response),
         remote_target: response_remote_target(response)?,
         cseq: response.cseq()?.seq,
         caller_addr,
         callee_addr,
-        session_expires: None,
+        session_expires,
     };
     table.insert(key.clone(), state);
     Some(key)

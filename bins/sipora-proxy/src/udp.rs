@@ -28,11 +28,12 @@ use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 use crate::dialog::{
-    DialogState, DialogTable, dialog_for_request, insert_dialog_from_response, remove_dialog,
+    DialogState, DialogTable, RefreshTable, cancel_session_guard, dialog_for_request,
+    insert_dialog_from_response, new_refresh_table, remove_dialog, spawn_session_guard,
 };
 use crate::forward_table::{
-    ForwardTable, PendingForward, find_branch_by_call_id, get_pending_forward, insert_forward,
-    prepare_response, spawn_forward_sweeper,
+    ForwardTable, PendingForward, find_branch_by_call_id, find_branches_by_call_id,
+    get_pending_forward, insert_forward, prepare_response, spawn_forward_sweeper,
 };
 use crate::routing::ProxyRouter;
 
@@ -70,8 +71,9 @@ pub async fn run_udp_proxy(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let udp = UdpTransport::bind(addr).await?;
-    let socket = udp.into_inner();
+    let socket = Arc::new(udp.into_inner());
     let router = ProxyRouter::new(cfg.max_forwards);
+    let refresh_table = new_refresh_table();
     let _forward_sweeper = spawn_forward_sweeper(forward_table.clone(), shutdown.clone());
     let mut buf = vec![0u8; 65535];
     loop {
@@ -97,6 +99,7 @@ pub async fn run_udp_proxy(
                             &forward_table,
                             &dialog_table,
                             &transaction_table,
+                            &refresh_table,
                             peer,
                             req,
                         )
@@ -109,6 +112,7 @@ pub async fn run_udp_proxy(
                             &forward_table,
                             &dialog_table,
                             &transaction_table,
+                            &refresh_table,
                             resp,
                         )
                         .await
@@ -124,17 +128,22 @@ pub async fn run_udp_proxy(
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
-    socket: &tokio::net::UdpSocket,
+    socket: &Arc<tokio::net::UdpSocket>,
     redis: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     dialog_table: &DialogTable,
     transaction_table: &TransactionTable,
+    refresh_table: &RefreshTable,
     peer: SocketAddr,
     mut req: Request,
 ) -> anyhow::Result<()> {
     apply_rfc3581(&mut req, peer);
+    if let Some(status) = enforce_sips_policy(&req) {
+        respond(socket, peer, &sip_response(&req, status)).await;
+        return Ok(());
+    }
     track_server_transaction(transaction_table, &req).await;
     match req.method {
         Method::Invite => {
@@ -158,12 +167,16 @@ async fn dispatch_request(
                 forward_table,
                 transaction_table,
                 dialog_table,
+                refresh_table,
                 peer,
                 req,
             )
             .await
         }
-        Method::Cancel => handle_cancel(socket, cfg, forward_table, peer, req).await,
+        Method::Cancel => {
+            handle_cancel(socket, cfg, forward_table, transaction_table, peer, req).await
+        }
+        Method::Prack => handle_prack(socket, cfg, forward_table, peer, req).await,
         Method::Options => {
             respond(socket, peer, &sip_options_ok(&req)).await;
             Ok(())
@@ -249,11 +262,12 @@ fn top_via_mut(headers: &mut [Header]) -> Option<&mut Via> {
 }
 
 async fn dispatch_response(
-    socket: &tokio::net::UdpSocket,
+    socket: &Arc<tokio::net::UdpSocket>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     dialog_table: &DialogTable,
     transaction_table: &TransactionTable,
+    refresh_table: &RefreshTable,
     mut resp: Response,
 ) -> anyhow::Result<()> {
     let Some(top_via) = response_top_via(&resp) else {
@@ -287,13 +301,22 @@ async fn dispatch_response(
         target = response_relay_addr(via).unwrap_or(target);
     }
     if first_success && let Some(pending) = pending {
-        let _ = insert_dialog_from_response(
+        let session_expires = resp.headers.iter().find_map(|h| match h {
+            Header::SessionExpires { delta_seconds, .. } => Some(*delta_seconds),
+            _ => None,
+        });
+        if let Some(dialog_key) = insert_dialog_from_response(
             dialog_table,
             &resp,
             pending.client_addr,
             pending.target_addr,
         )
-        .await;
+        .await
+        {
+            if let Some(se) = session_expires {
+                spawn_session_guard(dialog_table, refresh_table, dialog_key, se).await;
+            }
+        }
     }
     let bytes = serialize_message(&SipMessage::Response(resp));
     socket.send_to(&bytes, target).await?;
@@ -308,7 +331,7 @@ fn should_try_next_fork(resp: &Response, pending: Option<&PendingForward>) -> bo
 }
 
 async fn forward_next_fork(
-    socket: &tokio::net::UdpSocket,
+    socket: &Arc<tokio::net::UdpSocket>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
@@ -371,6 +394,7 @@ async fn handle_dialog_request(
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     dialog_table: &DialogTable,
+    refresh_table: &RefreshTable,
     peer: SocketAddr,
     mut req: Request,
 ) -> anyhow::Result<()> {
@@ -415,6 +439,7 @@ async fn handle_dialog_request(
     )
     .await?;
     if method == Method::Bye {
+        cancel_session_guard(refresh_table, &dialog_key).await;
         remove_dialog(dialog_table, &dialog_key);
     }
     Ok(())
@@ -474,7 +499,17 @@ async fn forward_dialog_request(
     if req.method != Method::Ack {
         track_client_transaction(transaction_table, &req, TransactionType::ClientNonInvite).await;
         let vias = collect_via_stack(&req.headers);
-        insert_forward(forward_table, branch, peer, target, vias, None, vec![], req.uri.clone()).await;
+        insert_forward(
+            forward_table,
+            branch,
+            peer,
+            target,
+            vias,
+            None,
+            vec![],
+            req.uri.clone(),
+        )
+        .await;
     }
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
@@ -483,7 +518,7 @@ async fn forward_dialog_request(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_invite(
-    socket: &tokio::net::UdpSocket,
+    socket: &Arc<tokio::net::UdpSocket>,
     pool: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
@@ -492,6 +527,14 @@ async fn handle_invite(
     peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<()> {
+    // RFC 3261 §17.2.1: send 100 Trying immediately on INVITE receipt
+    respond(socket, peer, &sip_response(&req, StatusCode::TRYING)).await;
+    // RFC 4028 §8: reject if Session-Expires is below proxy minimum
+    if let Some(status) = check_session_expires(&req) {
+        respond(socket, peer, &sip_response_with_min_se(&req, PROXY_MIN_SE)).await;
+        let _ = status;
+        return Ok(());
+    }
     if router.check_max_forwards(&req).is_some() {
         respond(
             socket,
@@ -569,7 +612,7 @@ async fn handle_invite(
 
 #[allow(clippy::too_many_arguments)]
 async fn forward_invite_request(
-    socket: &tokio::net::UdpSocket,
+    socket: &Arc<tokio::net::UdpSocket>,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     peer: SocketAddr,
@@ -598,7 +641,8 @@ async fn forward_invite_request(
     headers.extend(req.headers);
     req.headers = headers;
     ProxyRouter::decrement_max_forwards(&mut req.headers);
-    track_client_transaction(transaction_table, &req, TransactionType::ClientInvite).await;
+    // Extract transaction key before req is consumed by serialization
+    let tx_key = TransactionKey::from_request(&req);
     insert_forward(
         forward_table,
         branch,
@@ -612,6 +656,26 @@ async fn forward_invite_request(
     .await;
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
+    // Spawn RFC 3261 §17.1.1.2 Timer A: retransmit INVITE at T1, 2T1, 4T1, … capped at T2
+    let socket_arc = Arc::clone(socket);
+    let timer = tokio::spawn(async move {
+        let mut delay = sipora_sip::transaction::TIMER_T1;
+        loop {
+            tokio::time::sleep(delay).await;
+            if socket_arc.send_to(&bytes, target).await.is_err() {
+                return;
+            }
+            delay = (delay * 2).min(sipora_sip::transaction::TIMER_T2);
+        }
+    });
+    if let Some(key) = tx_key {
+        transaction_table
+            .write()
+            .await
+            .insert_with_timer(key, TransactionType::ClientInvite, timer.abort_handle());
+    } else {
+        timer.abort();
+    }
     Ok(())
 }
 
@@ -799,10 +863,88 @@ fn sip_response_www_auth(req: &Request, www: &str) -> SipMessage {
     })
 }
 
+/// Minimum Session-Expires value this proxy accepts (RFC 4028 §7.4).
+const PROXY_MIN_SE: u32 = 90;
+
+/// RFC 5630 §4: reject sips: URIs arriving over UDP with 403 Forbidden.
+fn enforce_sips_policy(req: &Request) -> Option<StatusCode> {
+    if req.uri.starts_with("sips:") {
+        Some(StatusCode::FORBIDDEN)
+    } else {
+        None
+    }
+}
+
+/// RFC 4028 §8: if the request carries Session-Expires below PROXY_MIN_SE, return 422.
+fn check_session_expires(req: &Request) -> Option<StatusCode> {
+    req.headers.iter().find_map(|h| match h {
+        Header::SessionExpires { delta_seconds, .. } if *delta_seconds < PROXY_MIN_SE => {
+            Some(StatusCode::SESSION_INTERVAL_TOO_SMALL)
+        }
+        _ => None,
+    })
+}
+
+/// Build a 422 Session Interval Too Small response with a Min-SE header.
+fn sip_response_with_min_se(req: &Request, min_se: u32) -> SipMessage {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            _ => {}
+        }
+    }
+    headers.push(Header::MinSE(min_se));
+    headers.push(Header::ContentLength(0));
+    SipMessage::Response(Response {
+        version: SipVersion::V2_0,
+        status: StatusCode::SESSION_INTERVAL_TOO_SMALL,
+        reason: StatusCode::SESSION_INTERVAL_TOO_SMALL.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
+/// RFC 3262 §3: route PRACK by looking up the original INVITE branch via Call-ID in ForwardTable.
+async fn handle_prack(
+    socket: &tokio::net::UdpSocket,
+    _cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    peer: SocketAddr,
+    mut req: Request,
+) -> anyhow::Result<()> {
+    let Some(call_id) = req.call_id() else {
+        respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    let Some(branch) = find_branch_by_call_id(forward_table, call_id).await else {
+        respond(socket, peer, &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST)).await;
+        return Ok(());
+    };
+    let target_addr = {
+        let table = forward_table.read().await;
+        table.get(&branch).map(|p| p.target_addr)
+    };
+    let Some(target) = target_addr else {
+        respond(socket, peer, &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST)).await;
+        return Ok(());
+    };
+    // Remove the top Via (our hop) before forwarding.
+    req.headers.retain(|h| !matches!(h, Header::Via(_)));
+    let bytes = serialize_message(&SipMessage::Request(req));
+    socket.send_to(&bytes, target).await?;
+    Ok(())
+}
+
 async fn handle_cancel(
     socket: &tokio::net::UdpSocket,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
     peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<()> {
@@ -811,23 +953,28 @@ async fn handle_cancel(
     let Some(call_id) = req.call_id() else {
         return Ok(());
     };
-    let Some(branch) = find_branch_by_call_id(forward_table, call_id).await else {
+    let branches = find_branches_by_call_id(forward_table, call_id).await;
+    if branches.is_empty() {
         return Ok(());
-    };
-    let pending_info = {
-        let table = forward_table.read().await;
-        table
-            .get(&branch)
-            .map(|p| (p.target_addr, p.forwarded_uri.clone()))
-    };
-    let Some((target_addr, forwarded_uri)) = pending_info else {
-        return Ok(());
-    };
-    // Forward CANCEL toward the callee. Keep the ForwardTable entry so the
-    // 487 response the callee sends back is relayed to the caller normally.
-    let cancel = build_cancel_request(&req, &branch, &forwarded_uri, cfg);
-    let bytes = serialize_message(&SipMessage::Request(cancel));
-    socket.send_to(&bytes, target_addr).await?;
+    }
+    for branch in branches {
+        let pending_info = {
+            let table = forward_table.read().await;
+            table
+                .get(&branch)
+                .map(|p| (p.target_addr, p.forwarded_uri.clone()))
+        };
+        let Some((target_addr, forwarded_uri)) = pending_info else {
+            continue;
+        };
+        // Forward CANCEL toward the callee. Keep the ForwardTable entry so the
+        // 487 response the callee sends back is relayed to the caller normally.
+        let cancel = build_cancel_request(&req, &branch, &forwarded_uri, cfg);
+        track_client_transaction(transaction_table, &cancel, TransactionType::ClientNonInvite)
+            .await;
+        let bytes = serialize_message(&SipMessage::Request(cancel));
+        socket.send_to(&bytes, target_addr).await?;
+    }
     Ok(())
 }
 
@@ -1350,7 +1497,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_invite_inserts_pending_forward() {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
         let peer = "127.0.0.1:5090".parse().unwrap();
@@ -1390,7 +1537,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_next_fork_sends_invite_to_remaining_target() {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
         let table = new_forward_table();

@@ -193,14 +193,11 @@ mod tests {
         let handle = ClientInviteTransaction::spawn_timer_a(event_tx);
         drop(event_rx);
         // After the channel receiver is dropped the task should exit cleanly.
-        let _ = tokio::time::timeout(
-            super::TIMER_T1 * 3,
-            handle,
-        )
-        .await;
+        let res = tokio::time::timeout(super::TIMER_T1 * 3, handle).await;
+        assert!(res.is_ok(), "task timed out");
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn timer_a_does_not_retransmit_after_provisional_response() {
         let (response_tx, _response_rx) = mpsc::channel(1);
         let (retransmit_tx, mut retransmit_rx) = mpsc::channel(1);

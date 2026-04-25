@@ -1,4 +1,4 @@
-use sipora_sip::types::header::{Header, Via};
+ use sipora_sip::types::header::{Header, Via};
 use sipora_sip::types::message::{Request, Response};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,20 +27,40 @@ pub fn new_forward_table() -> ForwardTable {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Looks up [`PendingForward`] entries whose `original_request` has the given SIP Call-ID.
+///
+/// Returns every matching branch key (one entry per forked INVITE leg).
+pub async fn find_branches_by_call_id(table: &ForwardTable, call_id: &str) -> Vec<String> {
+    table
+        .read()
+        .await
+        .iter()
+        .filter_map(|(branch, pending)| {
+            pending
+                .original_request
+                .as_ref()
+                .and_then(|req| req.call_id())
+                .filter(|id| *id == call_id)
+                .map(|_| branch.clone())
+        })
+        .collect()
+}
+
+/// Searches [`ForwardTable`] for a branch whose pending [`PendingForward::original_request`]
+/// has a matching Call-ID, and returns that branch name if found.
+///
+/// When several forks share the same Call-ID, this returns one match (see
+/// [`find_branches_by_call_id`] for all legs).
+pub async fn find_branch_by_call_id(table: &ForwardTable, call_id: &str) -> Option<String> {
+    find_branches_by_call_id(table, call_id)
+        .await
+        .into_iter()
+        .next()
+}
+
 /// Inserts a pending forward for `branch`.
 ///
 /// Returns the previous [`PendingForward`] when `branch` already existed (overwrite).
-pub async fn find_branch_by_call_id(table: &ForwardTable, call_id: &str) -> Option<String> {
-    table.read().await.iter().find_map(|(branch, pending)| {
-        pending
-            .original_request
-            .as_ref()
-            .and_then(|req| req.call_id())
-            .filter(|id| *id == call_id)
-            .map(|_| branch.clone())
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_forward(
     table: &ForwardTable,

@@ -17,6 +17,7 @@ impl StatusCode {
     pub const METHOD_NOT_ALLOWED: Self = Self(405);
     pub const PROXY_AUTH_REQUIRED: Self = Self(407);
     pub const REQUEST_TIMEOUT: Self = Self(408);
+    pub const SESSION_INTERVAL_TOO_SMALL: Self = Self(422);
     pub const INTERVAL_TOO_BRIEF: Self = Self(423);
     pub const TEMPORARILY_UNAVAILABLE: Self = Self(480);
     pub const CALL_DOES_NOT_EXIST: Self = Self(481);
@@ -43,6 +44,7 @@ impl StatusCode {
             405 => "Method Not Allowed",
             407 => "Proxy Authentication Required",
             408 => "Request Timeout",
+            422 => "Session Interval Too Small",
             423 => "Interval Too Brief",
             480 => "Temporarily Unavailable",
             481 => "Call/Transaction Does Not Exist",

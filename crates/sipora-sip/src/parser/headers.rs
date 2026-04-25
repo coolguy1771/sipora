@@ -72,8 +72,47 @@ fn match_header(name: &str, value: &[u8]) -> Header {
         "retry-after" => parse_u32_val(value)
             .map(Header::RetryAfter)
             .unwrap_or_else(|| ext(name, value)),
+        "rseq" => parse_u32_val(value)
+            .map(Header::RSeq)
+            .unwrap_or_else(|| ext(name, value)),
+        "rack" => parse_rack_value(value).unwrap_or_else(|| ext(name, value)),
+        "session-expires" | "x" => parse_session_expires(value).unwrap_or_else(|| ext(name, value)),
+        "min-se" => parse_u32_val(value)
+            .map(Header::MinSE)
+            .unwrap_or_else(|| ext(name, value)),
         _ => ext(name, value),
     }
+}
+
+fn parse_rack_value(input: &[u8]) -> Option<Header> {
+    let s = trim_str(input);
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let rseq = parts[0].parse().ok()?;
+    let cseq = parts[1].parse().ok()?;
+    let method = Method::from_bytes(parts[2].as_bytes());
+    Some(Header::RAck { rseq, cseq, method })
+}
+
+fn parse_session_expires(input: &[u8]) -> Option<Header> {
+    let s = trim_str(input);
+    let (num_str, rest) = match s.split_once(';') {
+        Some((n, r)) => (n, Some(r)),
+        None => (s.as_str(), None),
+    };
+    let delta_seconds = num_str.trim().parse().ok()?;
+    let refresher = rest.and_then(|params| {
+        params.split(';').find_map(|p| {
+            p.trim().strip_prefix("refresher=").and_then(|r| match r.trim() {
+                "uac" => Some(Refresher::Uac),
+                "uas" => Some(Refresher::Uas),
+                _ => None,
+            })
+        })
+    });
+    Some(Header::SessionExpires { delta_seconds, refresher })
 }
 
 fn ext(name: &str, value: &[u8]) -> Header {

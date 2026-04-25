@@ -24,7 +24,26 @@ pub enum Header {
     Supported(Vec<String>),
     Require(Vec<String>),
     RetryAfter(u32),
+    RSeq(u32),
+    RAck { rseq: u32, cseq: u32, method: Method },
+    SessionExpires { delta_seconds: u32, refresher: Option<Refresher> },
+    MinSE(u32),
     Extension { name: String, value: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresher {
+    Uac,
+    Uas,
+}
+
+impl Refresher {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Uac => "uac",
+            Self::Uas => "uas",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +140,10 @@ impl Header {
             Self::Supported(_) => "Supported",
             Self::Require(_) => "Require",
             Self::RetryAfter(_) => "Retry-After",
+            Self::RSeq(_) => "RSeq",
+            Self::RAck { .. } => "RAck",
+            Self::SessionExpires { .. } => "Session-Expires",
+            Self::MinSE(_) => "Min-SE",
             Self::Extension { name, .. } => name.as_str(),
         }
     }
