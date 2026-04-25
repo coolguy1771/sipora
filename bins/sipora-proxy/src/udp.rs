@@ -297,8 +297,18 @@ async fn release_register_commit_lock(redis: &RedisPool, lock_key: &str, token: 
             vec![token],
         )
         .await;
-    if let Err(e) = res {
-        tracing::warn!(%e, key = %lock_key, "register commit lock cas-del");
+    match res {
+        Ok(0) => {
+            tracing::debug!(
+                key = %lock_key,
+                token = %token,
+                "release_register_commit_lock LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH: Ok(0) CAS not applied (token mismatch, replay, or lock expired)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(%e, key = %lock_key, "register commit lock cas-del");
+        }
+        Ok(_) => {}
     }
 }
 
