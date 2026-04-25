@@ -105,4 +105,14 @@ mod tests {
 
         assert!(TransactionKey::from_request(&req).is_none());
     }
+
+    #[test]
+    fn transaction_key_accepts_valid_branch() {
+        let req = request_with_branch("z9hG4bK-abc123");
+        let key = TransactionKey::from_request(&req)
+            .expect("valid branch should produce a transaction key");
+        assert_eq!(key.branch, "z9hG4bK-abc123");
+        assert_eq!(key.sent_by, "client.example.com:5060");
+        assert_eq!(key.method, "INVITE");
+    }
 }
