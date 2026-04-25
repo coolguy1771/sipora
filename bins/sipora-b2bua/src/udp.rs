@@ -135,7 +135,7 @@ async fn forward_invite(
         port: Some(rt.sip_port),
         branch,
         received: None,
-        rport: None,
+        rport: sipora_sip::types::header::RportParam::Absent,
         params: vec![],
     });
     let mut headers = vec![via];

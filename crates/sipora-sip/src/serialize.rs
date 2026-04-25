@@ -109,9 +109,13 @@ fn serialize_via(via: &Via, buf: &mut Vec<u8>) {
         buf.extend_from_slice(b";received=");
         buf.extend_from_slice(recv.as_bytes());
     }
-    if let Some(rp) = via.rport {
-        buf.extend_from_slice(b";rport=");
-        buf.extend_from_slice(rp.to_string().as_bytes());
+    match via.rport {
+        RportParam::Absent => {}
+        RportParam::Requested => buf.extend_from_slice(b";rport"),
+        RportParam::Filled(rp) => {
+            buf.extend_from_slice(b";rport=");
+            buf.extend_from_slice(rp.to_string().as_bytes());
+        }
     }
 }
 
@@ -148,5 +152,50 @@ fn serialize_contacts(contacts: &[ContactValue], buf: &mut Vec<u8>) {
         if let Some(e) = c.expires {
             buf.extend_from_slice(format!(";expires={e}").as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::header::{RportParam, Transport, Via};
+
+    fn serialize_test_via(rport: RportParam) -> String {
+        let via = Via {
+            transport: Transport::Udp,
+            host: "client.example.com".to_owned(),
+            port: None,
+            branch: "z9hG4bK1".to_owned(),
+            received: None,
+            rport,
+            params: vec![],
+        };
+        let mut buf = Vec::new();
+
+        serialize_via(&via, &mut buf);
+
+        String::from_utf8(buf).expect("valid UTF-8")
+    }
+
+    #[test]
+    fn serializes_requested_rport_without_value() {
+        let via = serialize_test_via(RportParam::Requested);
+
+        assert!(via.contains(";rport"));
+        assert!(!via.contains(";rport="));
+    }
+
+    #[test]
+    fn serializes_filled_rport_with_value() {
+        let via = serialize_test_via(RportParam::Filled(9988));
+
+        assert!(via.contains(";rport=9988"));
+    }
+
+    #[test]
+    fn does_not_serialize_absent_rport() {
+        let via = serialize_test_via(RportParam::Absent);
+
+        assert!(!via.contains(";rport"));
     }
 }

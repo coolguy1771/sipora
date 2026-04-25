@@ -150,14 +150,14 @@ fn parse_host_port(s: &str) -> (String, Option<u16>) {
 type ViaParams = (
     String,
     Option<String>,
-    Option<u16>,
+    RportParam,
     Vec<(String, Option<String>)>,
 );
 
 fn parse_via_params(s: &str) -> ViaParams {
     let mut branch = String::new();
     let mut received = None;
-    let mut rport = None;
+    let mut rport = RportParam::Absent;
     let mut extras = Vec::new();
 
     for part in s.split(';') {
@@ -171,13 +171,19 @@ fn parse_via_params(s: &str) -> ViaParams {
             match k.as_str() {
                 "branch" => branch = v,
                 "received" => received = Some(v),
-                "rport" => rport = v.parse().ok(),
+                "rport" => {
+                    if let Ok(port) = v.parse() {
+                        rport = RportParam::Filled(port);
+                    } else {
+                        extras.push((k, Some(v)));
+                    }
+                }
                 _ => extras.push((k, Some(v))),
             }
         } else {
             let k = part.to_ascii_lowercase();
             if k == "rport" {
-                // rport with no value per RFC 3581
+                rport = RportParam::Requested;
             } else {
                 extras.push((k, None));
             }

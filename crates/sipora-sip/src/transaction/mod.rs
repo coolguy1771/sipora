@@ -10,6 +10,7 @@ pub mod manager;
 pub mod server_invite;
 pub mod server_non_invite;
 
+use crate::types::header::Via;
 use crate::types::message::Request;
 use std::time::Duration;
 
@@ -20,22 +21,33 @@ pub enum TransactionState {
     Proceeding,
     Completed,
     Confirmed,
+    Accepted,
     Terminated,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransactionKey {
     pub branch: String,
+    pub sent_by: String,
     pub method: String,
 }
 
 impl TransactionKey {
     pub fn from_request(req: &Request) -> Option<Self> {
-        let branch = req.via().first()?.branch.clone();
+        let vias = req.via();
+        let via = vias.first()?;
         Some(Self {
-            branch,
+            branch: via.branch.clone(),
+            sent_by: sent_by(via),
             method: req.method.as_str().to_owned(),
         })
+    }
+}
+
+fn sent_by(via: &Via) -> String {
+    match via.port {
+        Some(port) => format!("{}:{port}", via.host),
+        None => via.host.clone(),
     }
 }
 
@@ -49,3 +61,4 @@ pub const TIMER_H: Duration = Duration::from_secs(32);
 pub const TIMER_I: Duration = Duration::from_secs(5);
 pub const TIMER_J: Duration = Duration::from_secs(32);
 pub const TIMER_K: Duration = Duration::from_secs(5);
+pub const TIMER_L: Duration = TIMER_B;

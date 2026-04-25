@@ -65,6 +65,7 @@ fn extract_body(headers: &[Header], rest: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::header::RportParam;
     use crate::types::method::Method;
     use crate::types::status::StatusCode;
 
@@ -135,5 +136,70 @@ mod tests {
             }
             _ => panic!("expected request"),
         }
+    }
+
+    #[test]
+    fn parses_bare_rport_as_requested() {
+        let msg = b"REGISTER sip:example.com SIP/2.0\r\n\
+                     Via: SIP/2.0/UDP client.example.com;rport;branch=z9hG4bK1\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n";
+
+        let (_, parsed) = parse_sip_message(msg).unwrap();
+        let SipMessage::Request(req) = parsed else {
+            panic!("expected request");
+        };
+
+        assert_eq!(req.via()[0].rport, RportParam::Requested);
+    }
+
+    #[test]
+    fn parses_numeric_rport_as_filled() {
+        let msg = b"REGISTER sip:example.com SIP/2.0\r\n\
+                     Via: SIP/2.0/UDP client.example.com;rport=9988;branch=z9hG4bK1\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n";
+
+        let (_, parsed) = parse_sip_message(msg).unwrap();
+        let SipMessage::Request(req) = parsed else {
+            panic!("expected request");
+        };
+
+        assert_eq!(req.via()[0].rport, RportParam::Filled(9988));
+    }
+
+    #[test]
+    fn preserves_malformed_rport_without_requesting_rport() {
+        let msg = b"REGISTER sip:example.com SIP/2.0\r\n\
+                     Via: SIP/2.0/UDP client.example.com;rport=abc;branch=z9hG4bK1\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n";
+
+        let (_, parsed) = parse_sip_message(msg).unwrap();
+        let SipMessage::Request(req) = parsed else {
+            panic!("expected request");
+        };
+        let via = req.via()[0];
+
+        assert_eq!(via.rport, RportParam::Absent);
+        assert_eq!(
+            via.params,
+            vec![("rport".to_owned(), Some("abc".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn omits_absent_rport() {
+        let msg = b"REGISTER sip:example.com SIP/2.0\r\n\
+                     Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK1\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n";
+
+        let (_, parsed) = parse_sip_message(msg).unwrap();
+        let SipMessage::Request(req) = parsed else {
+            panic!("expected request");
+        };
+
+        assert_eq!(req.via()[0].rport, RportParam::Absent);
     }
 }

@@ -34,8 +34,15 @@ pub struct Via {
     pub port: Option<u16>,
     pub branch: String,
     pub received: Option<String>,
-    pub rport: Option<u16>,
+    pub rport: RportParam,
     pub params: Vec<(String, Option<String>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RportParam {
+    Absent,
+    Requested,
+    Filled(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
