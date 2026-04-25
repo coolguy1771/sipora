@@ -105,14 +105,19 @@ fn parse_session_expires(input: &[u8]) -> Option<Header> {
     let delta_seconds = num_str.trim().parse().ok()?;
     let refresher = rest.and_then(|params| {
         params.split(';').find_map(|p| {
-            p.trim().strip_prefix("refresher=").and_then(|r| match r.trim() {
-                "uac" => Some(Refresher::Uac),
-                "uas" => Some(Refresher::Uas),
-                _ => None,
-            })
+            p.trim()
+                .strip_prefix("refresher=")
+                .and_then(|r| match r.trim() {
+                    "uac" => Some(Refresher::Uac),
+                    "uas" => Some(Refresher::Uas),
+                    _ => None,
+                })
         })
     });
-    Some(Header::SessionExpires { delta_seconds, refresher })
+    Some(Header::SessionExpires {
+        delta_seconds,
+        refresher,
+    })
 }
 
 fn ext(name: &str, value: &[u8]) -> Header {

@@ -32,8 +32,9 @@ use crate::dialog::{
     insert_dialog_from_response, new_refresh_table, remove_dialog, spawn_session_guard,
 };
 use crate::forward_table::{
-    ForwardTable, PendingForward, find_branch_by_call_id, find_branches_by_call_id,
-    get_pending_forward, insert_forward, prepare_response, spawn_forward_sweeper,
+    ForwardTable, PendingForward, find_branch_by_call_id, find_branch_by_call_id_and_rseq,
+    find_branches_by_call_id, get_pending_forward, insert_forward, prepare_response,
+    spawn_forward_sweeper,
 };
 use crate::routing::ProxyRouter;
 
@@ -305,17 +306,17 @@ async fn dispatch_response(
             Header::SessionExpires { delta_seconds, .. } => Some(*delta_seconds),
             _ => None,
         });
-        if let Some(dialog_key) = insert_dialog_from_response(
-            dialog_table,
-            &resp,
-            pending.client_addr,
-            pending.target_addr,
-        )
-        .await
-        {
-            if let Some(se) = session_expires {
-                spawn_session_guard(dialog_table, refresh_table, dialog_key, se).await;
-            }
+        if let (Some(dialog_key), Some(se)) = (
+            insert_dialog_from_response(
+                dialog_table,
+                &resp,
+                pending.client_addr,
+                pending.target_addr,
+            )
+            .await,
+            session_expires,
+        ) {
+            spawn_session_guard(dialog_table, refresh_table, dialog_key, se).await;
         }
     }
     let bytes = serialize_message(&SipMessage::Response(resp));
@@ -388,6 +389,7 @@ fn response_relay_addr(via: &Via) -> Option<SocketAddr> {
     format!("{host}:{port}").parse().ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_dialog_request(
     socket: &tokio::net::UdpSocket,
     cfg: &UdpProxyConfig,
@@ -530,9 +532,8 @@ async fn handle_invite(
     // RFC 3261 §17.2.1: send 100 Trying immediately on INVITE receipt
     respond(socket, peer, &sip_response(&req, StatusCode::TRYING)).await;
     // RFC 4028 §8: reject if Session-Expires is below proxy minimum
-    if let Some(status) = check_session_expires(&req) {
+    if check_session_expires(&req).is_some() {
         respond(socket, peer, &sip_response_with_min_se(&req, PROXY_MIN_SE)).await;
-        let _ = status;
         return Ok(());
     }
     if router.check_max_forwards(&req).is_some() {
@@ -669,10 +670,11 @@ async fn forward_invite_request(
         }
     });
     if let Some(key) = tx_key {
-        transaction_table
-            .write()
-            .await
-            .insert_with_timer(key, TransactionType::ClientInvite, timer.abort_handle());
+        transaction_table.write().await.insert_with_timer(
+            key,
+            TransactionType::ClientInvite,
+            timer.abort_handle(),
+        );
     } else {
         timer.abort();
     }
@@ -903,16 +905,18 @@ fn sip_response_with_min_se(req: &Request, min_se: u32) -> SipMessage {
     SipMessage::Response(Response {
         version: SipVersion::V2_0,
         status: StatusCode::SESSION_INTERVAL_TOO_SMALL,
-        reason: StatusCode::SESSION_INTERVAL_TOO_SMALL.reason_phrase().to_owned(),
+        reason: StatusCode::SESSION_INTERVAL_TOO_SMALL
+            .reason_phrase()
+            .to_owned(),
         headers,
         body: Vec::new(),
     })
 }
 
-/// RFC 3262 §3: route PRACK by looking up the original INVITE branch via Call-ID in ForwardTable.
+/// RFC 3262 §3: route PRACK by `RAck` + Call-ID when possible, else Call-ID only.
 async fn handle_prack(
     socket: &tokio::net::UdpSocket,
-    _cfg: &UdpProxyConfig,
+    cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     peer: SocketAddr,
     mut req: Request,
@@ -921,8 +925,22 @@ async fn handle_prack(
         respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
-    let Some(branch) = find_branch_by_call_id(forward_table, call_id).await else {
-        respond(socket, peer, &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST)).await;
+    let branch = match prack_rack_tuple(&req) {
+        Some((rseq, cseq)) => {
+            match find_branch_by_call_id_and_rseq(forward_table, call_id, rseq, cseq).await {
+                Some(b) => Some(b),
+                None => find_branch_by_call_id(forward_table, call_id).await,
+            }
+        }
+        None => find_branch_by_call_id(forward_table, call_id).await,
+    };
+    let Some(branch) = branch else {
+        respond(
+            socket,
+            peer,
+            &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
+        )
+        .await;
         return Ok(());
     };
     let target_addr = {
@@ -930,14 +948,28 @@ async fn handle_prack(
         table.get(&branch).map(|p| p.target_addr)
     };
     let Some(target) = target_addr else {
-        respond(socket, peer, &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST)).await;
+        respond(
+            socket,
+            peer,
+            &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
+        )
+        .await;
         return Ok(());
     };
-    // Remove the top Via (our hop) before forwarding.
-    req.headers.retain(|h| !matches!(h, Header::Via(_)));
+    if let Some(i) = req.headers.iter().position(|h| matches!(h, Header::Via(_))) {
+        req.headers.remove(i);
+    }
+    prepend_proxy_via(&mut req, &cfg.advertise, cfg.sip_port);
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
     Ok(())
+}
+
+fn prack_rack_tuple(req: &Request) -> Option<(u32, u32)> {
+    req.headers.iter().find_map(|h| match h {
+        Header::RAck { rseq, cseq, .. } => Some((*rseq, *cseq)),
+        _ => None,
+    })
 }
 
 async fn handle_cancel(
@@ -1551,6 +1583,7 @@ mod tests {
             forwarded_uri: format!("sip:bob@{target_addr}"),
             final_forwarded: false,
             inserted_at: Instant::now(),
+            last_reliable_rseq: None,
         };
 
         let transaction_table = new_transaction_table();

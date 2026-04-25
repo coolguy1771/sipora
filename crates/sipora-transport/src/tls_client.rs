@@ -1,10 +1,9 @@
 //! Outbound TLS client pool for SIP over TLS (RFC 5630 / sips: URIs).
 //!
-//! [`TlsClientPool`] maintains one persistent TLS connection per remote `SocketAddr`.
-//! On the first write to a target the pool dials, performs a TLS 1.3 handshake
-//! (verified against the WebPKI root store), and caches the stream.  Subsequent
-//! calls reuse the cached stream; a failed write evicts the entry so the next
-//! call re-connects.
+//! [`TlsClientPool`] caches one TLS stream per `(SocketAddr, SNI hostname)` so different
+//! server names to the same address do not share a session. Each key uses an inner async
+//! mutex so at most one task connects for that key; the outer pool lock is not held across
+//! I/O.
 
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -17,7 +16,10 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-type Pool = Mutex<HashMap<SocketAddr, TlsStream<TcpStream>>>;
+type TlsTcp = TlsStream<TcpStream>;
+type ConnCell = Arc<tokio::sync::Mutex<Option<TlsTcp>>>;
+type PoolKey = (SocketAddr, String);
+type Pool = Mutex<HashMap<PoolKey, ConnCell>>;
 
 pub struct TlsClientPool {
     connector: TlsConnector,
@@ -41,8 +43,8 @@ impl TlsClientPool {
 
     /// Send `data` to `addr` using the SNI name `server_name`.
     ///
-    /// Opens a new TLS connection if none is cached; evicts and retries once on
-    /// write failure.
+    /// Opens a new TLS connection if none is cached for this `(addr, SNI)` pair. On write
+    /// failure the entry is evicted and one reconnect attempt is made.
     pub async fn send(
         &self,
         addr: SocketAddr,
@@ -50,30 +52,42 @@ impl TlsClientPool {
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = ServerName::try_from(server_name.to_owned())?;
+        let key: PoolKey = (addr, server_name.to_owned());
 
-        // Try cached connection first.
-        {
-            let mut pool = self.pool.lock().await;
-            if let Some(stream) = pool.get_mut(&addr) {
-                if stream.write_all(data).await.is_ok() {
-                    return Ok(());
-                }
-                // Write failed — evict the stale entry.
-                pool.remove(&addr);
+        for _ in 0..2u8 {
+            let cell = {
+                let mut pool = self.pool.lock().await;
+                pool.entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+                    .clone()
+            };
+
+            let mut inner = cell.lock().await;
+            if inner.is_none() {
+                let tcp = TcpStream::connect(addr).await?;
+                let tls = self.connector.connect(name.clone(), tcp).await?;
+                *inner = Some(tls);
             }
+            let stream = inner
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("TLS stream missing after connect"))?;
+            if stream.write_all(data).await.is_ok() {
+                return Ok(());
+            }
+            *inner = None;
+            drop(inner);
+            self.pool.lock().await.remove(&key);
         }
 
-        // Establish a fresh connection.
-        let tcp = TcpStream::connect(addr).await?;
-        let mut tls = self.connector.connect(name, tcp).await?;
-        tls.write_all(data).await?;
-        self.pool.lock().await.insert(addr, tls);
-        Ok(())
+        Err(std::io::Error::other("TLS send failed after retry").into())
     }
 
-    /// Explicitly close and evict the connection to `addr`.
-    pub async fn evict(&self, addr: SocketAddr) {
-        self.pool.lock().await.remove(&addr);
+    /// Explicitly close and evict the connection for `addr` and `server_name`.
+    pub async fn evict(&self, addr: SocketAddr, server_name: &str) {
+        self.pool
+            .lock()
+            .await
+            .remove(&(addr, server_name.to_owned()));
     }
 }
 

@@ -1,4 +1,4 @@
- use sipora_sip::types::header::{Header, Via};
+use sipora_sip::types::header::{Header, Via};
 use sipora_sip::types::message::{Request, Response};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,6 +19,8 @@ pub struct PendingForward {
     pub forwarded_uri: String,
     pub final_forwarded: bool,
     pub inserted_at: Instant,
+    /// Last `RSeq` from a relayed reliable 1xx on this fork (RFC 3262 PRACK routing).
+    pub last_reliable_rseq: Option<u32>,
 }
 
 pub type ForwardTable = Arc<RwLock<HashMap<String, PendingForward>>>;
@@ -58,6 +60,42 @@ pub async fn find_branch_by_call_id(table: &ForwardTable, call_id: &str) -> Opti
         .next()
 }
 
+/// Picks the fork whose last relayed `RSeq` and INVITE CSeq match PRACK `RAck` (RFC 3262).
+///
+/// Returns [`None`] when `RAck` does not uniquely identify a leg (missing or ambiguous).
+pub async fn find_branch_by_call_id_and_rseq(
+    table: &ForwardTable,
+    call_id: &str,
+    rseq: u32,
+    rack_cseq: u32,
+) -> Option<String> {
+    let table = table.read().await;
+    let mut matches: Vec<String> = table
+        .iter()
+        .filter(|(_, pending)| {
+            let call_match = pending
+                .original_request
+                .as_ref()
+                .and_then(|req| req.call_id())
+                .is_some_and(|id| id == call_id);
+            if !call_match || pending.last_reliable_rseq != Some(rseq) {
+                return false;
+            }
+            pending
+                .original_request
+                .as_ref()
+                .and_then(|req| req.cseq())
+                .is_none_or(|c| c.seq == rack_cseq)
+        })
+        .map(|(branch, _)| branch.clone())
+        .collect();
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
 /// Inserts a pending forward for `branch`.
 ///
 /// Returns the previous [`PendingForward`] when `branch` already existed (overwrite).
@@ -81,6 +119,7 @@ pub async fn insert_forward(
         forwarded_uri,
         final_forwarded: false,
         inserted_at: Instant::now(),
+        last_reliable_rseq: None,
     };
     let prev = table.write().await.insert(branch.clone(), pending);
     if prev.is_some() {
@@ -103,6 +142,13 @@ pub async fn prepare_response(
 ) -> Option<SocketAddr> {
     let mut forwards = table.write().await;
     let pending = forwards.get_mut(branch)?;
+
+    if let Some(rseq) = response.headers.iter().find_map(|h| match h {
+        Header::RSeq(n) => Some(*n),
+        _ => None,
+    }) {
+        pending.last_reliable_rseq = Some(rseq);
+    }
 
     if response.status.is_success() && pending.final_forwarded {
         return None;

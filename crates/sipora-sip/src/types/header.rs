@@ -25,10 +25,20 @@ pub enum Header {
     Require(Vec<String>),
     RetryAfter(u32),
     RSeq(u32),
-    RAck { rseq: u32, cseq: u32, method: Method },
-    SessionExpires { delta_seconds: u32, refresher: Option<Refresher> },
+    RAck {
+        rseq: u32,
+        cseq: u32,
+        method: Method,
+    },
+    SessionExpires {
+        delta_seconds: u32,
+        refresher: Option<Refresher>,
+    },
     MinSE(u32),
-    Extension { name: String, value: String },
+    Extension {
+        name: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -94,7 +94,10 @@ fn serialize_header_value(header: &Header, buf: &mut Vec<u8>) {
             buf.push(b' ');
             buf.extend_from_slice(method.as_str().as_bytes());
         }
-        Header::SessionExpires { delta_seconds, refresher } => {
+        Header::SessionExpires {
+            delta_seconds,
+            refresher,
+        } => {
             buf.extend_from_slice(delta_seconds.to_string().as_bytes());
             if let Some(r) = refresher {
                 buf.extend_from_slice(b";refresher=");

@@ -83,7 +83,10 @@ pub async fn spawn_session_guard(
         tracing::warn!(call_id = %key_for_task.call_id, "session timer expired — removing zombie dialog");
         dialog_table.invalidate(&key_for_task);
     });
-    refresh_table.lock().await.insert(key, handle.abort_handle());
+    let mut guard = refresh_table.lock().await;
+    if let Some(prev) = guard.insert(key, handle.abort_handle()) {
+        prev.abort();
+    }
 }
 
 /// Cancels any running session guard for the given dialog (called on BYE).
