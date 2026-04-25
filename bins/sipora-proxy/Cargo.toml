@@ -26,3 +26,4 @@ sipora-data = { workspace = true }
 sipora-edge = { workspace = true }
 fred = { workspace = true }
 sqlx = { workspace = true }
+moka = { workspace = true }

@@ -6,6 +6,7 @@ use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use moka::Expiry;
 use moka::future::Cache;
+use rand::RngExt;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,6 +61,9 @@ struct ResolveResult {
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_TARGET_CACHE_SIZE: u64 = 4096;
+
+/// Upper bound for merging TTLs when aggregating SRV host lookups.
+const RESOLVE_AGGREGATE_TTL_CAP: Duration = Duration::from_secs(u64::MAX / 2);
 
 static DNS_CACHE: OnceLock<Cache<String, CachedTargets>> = OnceLock::new();
 static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
@@ -191,7 +195,7 @@ async fn resolve_ordered_srv(
 ) -> ResolveResult {
     let mut result = ResolveResult {
         targets: Vec::new(),
-        ttl: Duration::from_secs(u64::MAX / 2),
+        ttl: RESOLVE_AGGREGATE_TTL_CAP,
     };
 
     for (_, _, port, host) in srvs {
@@ -249,10 +253,24 @@ async fn lookup_ip(host: &str) -> Option<hickory_resolver::lookup_ip::LookupIp> 
 
 fn resolver() -> Option<&'static TokioResolver> {
     RESOLVER
-        .get_or_init(|| {
-            TokioResolver::builder_tokio()
-                .ok()
-                .and_then(|builder| builder.build().ok())
+        .get_or_init(|| match TokioResolver::builder_tokio() {
+            Ok(builder) => match builder.build() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to initialize TokioResolver (build)"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to initialize TokioResolver (builder_tokio)"
+                );
+                None
+            }
         })
         .as_ref()
 }
@@ -307,8 +325,64 @@ fn default_port(transport: SipTransport) -> u16 {
     }
 }
 
+/// Orders SRV tuples by priority (RFC 2782), then per-priority group:
+/// zero-weight records first, then weighted random order for non-zero weights.
 fn sort_srv_records(records: &mut [(u16, u16, u16, String)]) {
-    records.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    if records.is_empty() {
+        return;
+    }
+    let input = records.to_vec();
+    let mut priorities: Vec<u16> = input.iter().map(|(p, _, _, _)| *p).collect();
+    priorities.sort_unstable();
+    priorities.dedup();
+
+    let mut out = Vec::with_capacity(input.len());
+    for pri in priorities {
+        let group: Vec<_> = input
+            .iter()
+            .filter(|(p, _, _, _)| *p == pri)
+            .cloned()
+            .collect();
+        out.extend(reorder_srv_priority_group(group));
+    }
+    for (i, rec) in out.into_iter().enumerate() {
+        records[i] = rec;
+    }
+}
+
+fn reorder_srv_priority_group(
+    records: Vec<(u16, u16, u16, String)>,
+) -> Vec<(u16, u16, u16, String)> {
+    let mut zeros = Vec::new();
+    let mut weighted = Vec::new();
+    for rec in records {
+        if rec.1 == 0 {
+            zeros.push(rec);
+        } else {
+            weighted.push(rec);
+        }
+    }
+    let mut rng = rand::rng();
+    let mut out = zeros;
+    while !weighted.is_empty() {
+        let sum: u32 = weighted.iter().map(|(_, w, _, _)| *w as u32).sum();
+        if sum == 0 {
+            out.append(&mut weighted);
+            break;
+        }
+        let pick = rng.random_range(0..sum);
+        let mut acc = 0u32;
+        let idx = weighted
+            .iter()
+            .enumerate()
+            .find_map(|(i, (_, w, _, _))| {
+                acc += *w as u32;
+                (acc > pick).then_some(i)
+            })
+            .unwrap_or(0);
+        out.push(weighted.remove(idx));
+    }
+    out
 }
 
 fn cache_key(domain: &str, port: Option<u16>, transport: SipTransport) -> String {
@@ -336,18 +410,46 @@ mod tests {
     }
 
     #[test]
-    fn sorts_srv_records_by_priority_then_weight() {
+    fn sorts_srv_by_ascending_priority_value() {
         let mut records = vec![
-            (20, 100, 5060, "late.example.com".to_string()),
-            (10, 1, 5060, "low.example.com".to_string()),
-            (10, 10, 5060, "high.example.com".to_string()),
+            (20, 50, 5060, "pri20.example.com".to_string()),
+            (10, 50, 5060, "pri10.example.com".to_string()),
         ];
 
         sort_srv_records(&mut records);
 
-        assert_eq!(records[0].3, "high.example.com");
-        assert_eq!(records[1].3, "low.example.com");
-        assert_eq!(records[2].3, "late.example.com");
+        assert_eq!(records[0].0, 10);
+        assert_eq!(records[1].0, 20);
+    }
+
+    #[test]
+    fn sorts_srv_zero_weight_before_nonzero_in_priority_group() {
+        let mut records = vec![
+            (10, 5, 5060, "w5.example.com".to_string()),
+            (10, 0, 5060, "z0.example.com".to_string()),
+            (10, 8, 5060, "w8.example.com".to_string()),
+        ];
+
+        sort_srv_records(&mut records);
+
+        assert_eq!(records[0].3, "z0.example.com");
+    }
+
+    #[test]
+    fn sorts_srv_same_priority_preserves_multiset() {
+        let mut records = vec![
+            (10, 3, 5060, "a.example.com".to_string()),
+            (10, 3, 5060, "b.example.com".to_string()),
+            (10, 3, 5060, "c.example.com".to_string()),
+        ];
+        let mut before: Vec<_> = records.iter().map(|(_, _, _, h)| h.clone()).collect();
+        before.sort();
+
+        sort_srv_records(&mut records);
+
+        let mut after: Vec<_> = records.iter().map(|(_, _, _, h)| h.clone()).collect();
+        after.sort();
+        assert_eq!(after, before);
     }
 
     #[test]

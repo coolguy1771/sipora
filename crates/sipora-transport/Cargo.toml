@@ -20,3 +20,4 @@ sipora-sip = { workspace = true }
 sipora-core = { workspace = true }
 hickory-resolver = { workspace = true }
 moka = { workspace = true }
+rand = { workspace = true }

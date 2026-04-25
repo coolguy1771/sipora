@@ -190,6 +190,7 @@ mod tests {
         let (mut client, _) = connect_async(request).await.unwrap();
 
         client.send(Message::Text("\r\n".into())).await.unwrap();
+        client.send(Message::Text("\r\n\r\n".into())).await.unwrap();
         client
             .send(Message::Text(
                 "OPTIONS sip:example.com SIP/2.0\r\n\r\n".into(),

@@ -24,10 +24,12 @@ use sipora_transport::udp::UdpTransport;
 use sqlx::PgPool;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
-use crate::dialog::{DialogState, DialogTable, dialog_for_request, insert_dialog_from_response};
+use crate::dialog::{
+    DialogState, DialogTable, dialog_for_request, insert_dialog_from_response, remove_dialog,
+};
 use crate::forward_table::{
     ForwardTable, PendingForward, get_pending_forward, insert_forward, prepare_response,
     spawn_forward_sweeper,
@@ -189,8 +191,7 @@ async fn track_server_transaction(table: &TransactionTable, req: &Request) {
         Method::Invite => TransactionType::ServerInvite,
         _ => TransactionType::ServerNonInvite,
     };
-    let (tx, _rx) = mpsc::channel(1);
-    table.write().await.insert(key, tx_type, tx);
+    table.write().await.insert(key, tx_type);
 }
 
 async fn track_client_transaction(
@@ -201,8 +202,7 @@ async fn track_client_transaction(
     let Some(key) = TransactionKey::from_request(req) else {
         return;
     };
-    let (tx, _rx) = mpsc::channel(1);
-    table.write().await.insert(key, tx_type, tx);
+    table.write().await.insert(key, tx_type);
 }
 
 async fn remove_client_transaction(table: &TransactionTable, resp: &Response) {
@@ -377,7 +377,7 @@ async fn handle_dialog_request(
     peer: SocketAddr,
     mut req: Request,
 ) -> anyhow::Result<()> {
-    let Some((_, state)) = dialog_for_request(dialog_table, &req).await else {
+    let Some((dialog_key, state)) = dialog_for_request(dialog_table, &req).await else {
         if req.method != Method::Ack {
             respond(
                 socket,
@@ -405,6 +405,7 @@ async fn handle_dialog_request(
         .await;
         return Ok(());
     };
+    let method = req.method.clone();
     forward_dialog_request(
         socket,
         forward_table,
@@ -415,7 +416,11 @@ async fn handle_dialog_request(
         target,
         cfg,
     )
-    .await
+    .await?;
+    if method == Method::Bye {
+        remove_dialog(dialog_table, &dialog_key);
+    }
+    Ok(())
 }
 
 fn dialog_target_uri(req: &mut Request, state: &DialogState, cfg: &UdpProxyConfig) -> String {

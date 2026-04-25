@@ -1,7 +1,5 @@
 use super::TransactionKey;
-use crate::types::message::Response;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionType {
@@ -14,7 +12,6 @@ pub enum TransactionType {
 pub struct TransactionEntry {
     pub key: TransactionKey,
     pub tx_type: TransactionType,
-    pub response_tx: mpsc::Sender<Response>,
 }
 
 pub struct TransactionManager {
@@ -28,16 +25,10 @@ impl TransactionManager {
         }
     }
 
-    pub fn insert(
-        &mut self,
-        key: TransactionKey,
-        tx_type: TransactionType,
-        response_tx: mpsc::Sender<Response>,
-    ) {
+    pub fn insert(&mut self, key: TransactionKey, tx_type: TransactionType) {
         let entry = TransactionEntry {
             key: key.clone(),
             tx_type,
-            response_tx,
         };
         self.transactions.insert(key, entry);
     }
@@ -107,15 +98,13 @@ mod tests {
     #[test]
     fn manager_keeps_colliding_branches_from_different_sent_by_values() {
         let mut manager = TransactionManager::new();
-        let (tx_a, _rx_a) = mpsc::channel(1);
-        let (tx_b, _rx_b) = mpsc::channel(1);
         let key_a = TransactionKey::from_request(&request_from("a.example.com", Some(5060)))
             .expect("transaction key");
         let key_b = TransactionKey::from_request(&request_from("b.example.com", Some(5060)))
             .expect("transaction key");
 
-        manager.insert(key_a.clone(), TransactionType::ServerInvite, tx_a);
-        manager.insert(key_b.clone(), TransactionType::ServerInvite, tx_b);
+        manager.insert(key_a.clone(), TransactionType::ServerInvite);
+        manager.insert(key_b.clone(), TransactionType::ServerInvite);
 
         assert_eq!(manager.len(), 2);
         assert!(manager.find(&key_a).is_some());

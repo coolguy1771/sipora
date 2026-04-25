@@ -25,6 +25,9 @@ pub fn new_forward_table() -> ForwardTable {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Inserts a pending forward for `branch`.
+///
+/// Returns the previous [`PendingForward`] when `branch` already existed (overwrite).
 pub async fn insert_forward(
     table: &ForwardTable,
     branch: String,
@@ -33,19 +36,24 @@ pub async fn insert_forward(
     original_via_stack: Vec<Via>,
     original_request: Option<Request>,
     remaining_targets: Vec<String>,
-) {
-    table.write().await.insert(
-        branch,
-        PendingForward {
-            client_addr,
-            target_addr,
-            original_via_stack,
-            original_request,
-            remaining_targets,
-            final_forwarded: false,
-            inserted_at: Instant::now(),
-        },
-    );
+) -> Option<PendingForward> {
+    let pending = PendingForward {
+        client_addr,
+        target_addr,
+        original_via_stack,
+        original_request,
+        remaining_targets,
+        final_forwarded: false,
+        inserted_at: Instant::now(),
+    };
+    let prev = table.write().await.insert(branch.clone(), pending);
+    if prev.is_some() {
+        tracing::warn!(
+            branch = %branch,
+            "insert_forward: replaced existing pending forward for branch"
+        );
+    }
+    prev
 }
 
 pub async fn get_pending_forward(table: &ForwardTable, branch: &str) -> Option<PendingForward> {
@@ -130,6 +138,7 @@ mod tests {
     use sipora_sip::types::message::SipVersion;
     use sipora_sip::types::method::Method;
     use sipora_sip::types::status::StatusCode;
+    use std::time::Duration;
 
     fn via(host: &str, branch: &str) -> Via {
         Via {
@@ -239,5 +248,179 @@ mod tests {
 
         assert_eq!(target, Some(client_addr));
         assert!(table.read().await.is_empty());
+    }
+
+    fn response_one_via(status: StatusCode) -> Response {
+        Response {
+            version: SipVersion::V2_0,
+            status,
+            reason: status.reason_phrase().to_owned(),
+            headers: vec![
+                Header::Via(via("proxy.example.com", "z9hG4bK-proxy")),
+                Header::From(NameAddr {
+                    display_name: None,
+                    uri: "sip:alice@example.com".to_owned(),
+                    tag: Some("from-tag".to_owned()),
+                    params: vec![],
+                }),
+                Header::To(NameAddr {
+                    display_name: None,
+                    uri: "sip:bob@example.com".to_owned(),
+                    tag: Some("to-tag".to_owned()),
+                    params: vec![],
+                }),
+                Header::CallId("call-1".to_owned()),
+                Header::CSeq(CSeq {
+                    seq: 1,
+                    method: Method::Invite,
+                }),
+            ],
+            body: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirection_response_removes_forward_even_with_remaining_targets() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy".to_owned(),
+            client_addr,
+            client_addr,
+            vec![],
+            None,
+            vec!["sip:bob@backup.example.com".to_owned()],
+        )
+        .await;
+        let mut resp = response(StatusCode::MOVED_TEMPORARILY);
+
+        let target = prepare_response(&table, "z9hG4bK-proxy", &mut resp).await;
+
+        assert_eq!(target, Some(client_addr));
+        assert!(table.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_response_restores_original_via_stack_order() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        let stack = vec![
+            via("orig-a.example.com", "z9hG4bKa"),
+            via("orig-b.example.com", "z9hG4bKb"),
+        ];
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy".to_owned(),
+            client_addr,
+            client_addr,
+            stack,
+            None,
+            vec![],
+        )
+        .await;
+        let mut resp = response_one_via(StatusCode::OK);
+
+        let _ = prepare_response(&table, "z9hG4bK-proxy", &mut resp).await;
+
+        let Header::Via(top) = &resp.headers[0] else {
+            panic!("expected Via");
+        };
+        let Header::Via(second) = &resp.headers[1] else {
+            panic!("expected second Via");
+        };
+        assert_eq!(top.host, "orig-a.example.com");
+        assert_eq!(second.host, "orig-b.example.com");
+    }
+
+    #[tokio::test]
+    async fn provisional_response_forwards_without_final_forwarded() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy".to_owned(),
+            client_addr,
+            client_addr,
+            vec![],
+            None,
+            vec![],
+        )
+        .await;
+        let mut resp = response(StatusCode::RINGING);
+
+        let target = prepare_response(&table, "z9hG4bK-proxy", &mut resp).await;
+
+        assert_eq!(target, Some(client_addr));
+        assert!(!table.read().await["z9hG4bK-proxy"].final_forwarded);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_forwards_drops_stale_inserts() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        insert_forward(
+            &table,
+            "stale".to_owned(),
+            client_addr,
+            client_addr,
+            vec![],
+            None,
+            vec![],
+        )
+        .await;
+        {
+            let mut forwards = table.write().await;
+            forwards.get_mut("stale").unwrap().inserted_at =
+                Instant::now() - PENDING_FORWARD_TTL - Duration::from_secs(1);
+        }
+        insert_forward(
+            &table,
+            "fresh".to_owned(),
+            client_addr,
+            client_addr,
+            vec![],
+            None,
+            vec![],
+        )
+        .await;
+
+        sweep_expired_forwards(&table).await;
+
+        let forwards = table.read().await;
+        assert!(!forwards.contains_key("stale"));
+        assert!(forwards.contains_key("fresh"));
+    }
+
+    #[tokio::test]
+    async fn insert_forward_overwrite_returns_previous() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        let other = "127.0.0.1:5070".parse().unwrap();
+        assert!(
+            insert_forward(
+                &table,
+                "same-branch".to_owned(),
+                client_addr,
+                client_addr,
+                vec![],
+                None,
+                vec![],
+            )
+            .await
+            .is_none()
+        );
+        let prev = insert_forward(
+            &table,
+            "same-branch".to_owned(),
+            client_addr,
+            other,
+            vec![],
+            None,
+            vec![],
+        )
+        .await;
+        assert_eq!(prev.map(|p| p.target_addr), Some(client_addr));
+        assert_eq!(table.read().await["same-branch"].target_addr, other);
     }
 }

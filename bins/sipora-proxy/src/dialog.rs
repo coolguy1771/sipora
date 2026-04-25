@@ -1,9 +1,26 @@
+//! In-dialog routing state for the UDP proxy.
+//!
+//! ## Dialog table TTL
+//!
+//! Entries are stored in a bounded [`moka::sync::Cache`]. They expire after
+//! [`DEFAULT_DIALOG_TABLE_TTL`] unless replaced by a newer insert, and are
+//! capped at [`DEFAULT_DIALOG_TABLE_MAX_ENTRIES`] (LRU eviction under pressure).
+//! Successful BYE forwarding removes the entry immediately via [`remove_dialog`].
+
+use moka::sync::Cache;
 use sipora_sip::types::header::Header;
 use sipora_sip::types::message::{Request, Response};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+
+/// Max dialog rows kept in memory before LRU eviction.
+pub const DEFAULT_DIALOG_TABLE_MAX_ENTRIES: u64 = 50_000;
+
+/// Time-to-live for a dialog row after insert or last upsert.
+///
+/// Configure process-wide by changing this constant (or add config wiring later).
+pub const DEFAULT_DIALOG_TABLE_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DialogKey {
@@ -13,7 +30,7 @@ pub struct DialogKey {
 }
 
 impl DialogKey {
-    fn reversed(&self) -> Self {
+    pub(crate) fn reversed(&self) -> Self {
         Self {
             call_id: self.call_id.clone(),
             from_tag: self.to_tag.clone(),
@@ -32,10 +49,20 @@ pub struct DialogState {
     pub session_expires: Option<u32>,
 }
 
-pub type DialogTable = Arc<RwLock<HashMap<DialogKey, DialogState>>>;
+pub type DialogTable = Arc<Cache<DialogKey, DialogState>>;
 
 pub fn new_dialog_table() -> DialogTable {
-    Arc::new(RwLock::new(HashMap::new()))
+    Arc::new(
+        Cache::builder()
+            .max_capacity(DEFAULT_DIALOG_TABLE_MAX_ENTRIES)
+            .time_to_live(DEFAULT_DIALOG_TABLE_TTL)
+            .build(),
+    )
+}
+
+/// Drops a dialog after successful BYE handling or administrative cleanup.
+pub fn remove_dialog(table: &DialogTable, dialog_key: &DialogKey) {
+    table.invalidate(dialog_key);
 }
 
 pub async fn insert_dialog_from_response(
@@ -53,7 +80,7 @@ pub async fn insert_dialog_from_response(
         callee_addr,
         session_expires: None,
     };
-    table.write().await.insert(key.clone(), state);
+    table.insert(key.clone(), state);
     Some(key)
 }
 
@@ -62,18 +89,11 @@ pub async fn dialog_for_request(
     request: &Request,
 ) -> Option<(DialogKey, DialogState)> {
     let key = request_dialog_key(request)?;
-    let dialogs = table.read().await;
-    dialogs
-        .get(&key)
-        .cloned()
-        .map(|state| (key.clone(), state))
-        .or_else(|| {
-            let reversed = key.reversed();
-            dialogs
-                .get(&reversed)
-                .cloned()
-                .map(|state| (reversed, state))
-        })
+    if let Some(state) = table.get(&key) {
+        return Some((key, state));
+    }
+    let rev = key.reversed();
+    table.get(&rev).map(|state| (rev, state))
 }
 
 fn response_dialog_key(response: &Response) -> Option<DialogKey> {
@@ -150,7 +170,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = table.read().await[&key].clone();
+        let state = table.get(&key).expect("dialog present");
         assert_eq!(state.remote_target, "sip:bob@callee.example.com");
         assert_eq!(state.route_set, vec!["<sip:edge.example.com;lr>"]);
         assert_eq!(state.cseq, 1);
