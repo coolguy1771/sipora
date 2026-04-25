@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod sip_tcp;
 pub mod tcp;
 pub mod tls;

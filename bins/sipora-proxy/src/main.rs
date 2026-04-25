@@ -1,3 +1,5 @@
+mod dialog;
+mod forward_table;
 mod redirect;
 mod routing;
 mod udp;
@@ -78,8 +80,21 @@ async fn main() -> Result<()> {
         nonce_ttl_s: nonce_ttl,
         pg,
     };
+    let forward_table = forward_table::new_forward_table();
+    let dialog_table = dialog::new_dialog_table();
+    let transaction_table = udp::new_transaction_table();
     tokio::spawn(async move {
-        if let Err(e) = udp::run_udp_proxy(sip_addr, redis, udp_cfg, shutdown_rx).await {
+        if let Err(e) = udp::run_udp_proxy(
+            sip_addr,
+            redis,
+            udp_cfg,
+            forward_table,
+            dialog_table,
+            transaction_table,
+            shutdown_rx,
+        )
+        .await
+        {
             tracing::error!("udp proxy: {e}");
         }
     });

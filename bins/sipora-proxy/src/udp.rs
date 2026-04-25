@@ -13,16 +13,25 @@ use sipora_location::ContactBinding;
 use sipora_location::redis_store::{list_contact_uris, upsert_contact};
 use sipora_sip::parser::message::parse_sip_message;
 use sipora_sip::serialize::serialize_message;
+use sipora_sip::transaction::TransactionKey;
+use sipora_sip::transaction::manager::{TransactionManager, TransactionType};
 use sipora_sip::types::header::{Header, Transport, Via};
 use sipora_sip::types::message::{Request, Response, SipMessage, SipVersion};
 use sipora_sip::types::method::Method;
 use sipora_sip::types::status::StatusCode;
+use sipora_transport::dns::{SipTransport, resolve_sip_targets};
 use sipora_transport::udp::UdpTransport;
 use sqlx::PgPool;
-use std::net::SocketAddr;
-use tokio::sync::watch;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use tokio::sync::{RwLock, mpsc, watch};
 use uuid::Uuid;
 
+use crate::dialog::{DialogState, DialogTable, dialog_for_request, insert_dialog_from_response};
+use crate::forward_table::{
+    ForwardTable, PendingForward, get_pending_forward, insert_forward, prepare_response,
+    spawn_forward_sweeper,
+};
 use crate::routing::ProxyRouter;
 
 /// Expiry clamp range for REGISTER.
@@ -43,15 +52,25 @@ pub struct UdpProxyConfig {
     pub pg: PgPool,
 }
 
+pub type TransactionTable = Arc<RwLock<TransactionManager>>;
+
+pub fn new_transaction_table() -> TransactionTable {
+    Arc::new(RwLock::new(TransactionManager::new()))
+}
+
 pub async fn run_udp_proxy(
     addr: SocketAddr,
     redis: RedisPool,
     cfg: UdpProxyConfig,
+    forward_table: ForwardTable,
+    dialog_table: DialogTable,
+    transaction_table: TransactionTable,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let udp = UdpTransport::bind(addr).await?;
     let socket = udp.into_inner();
     let router = ProxyRouter::new(cfg.max_forwards);
+    let _forward_sweeper = spawn_forward_sweeper(forward_table.clone(), shutdown.clone());
     let mut buf = vec![0u8; 65535];
     loop {
         tokio::select! {
@@ -66,19 +85,34 @@ pub async fn run_udp_proxy(
                 let Ok((_, msg)) = parse_sip_message(data) else {
                     continue;
                 };
-                let SipMessage::Request(req) = msg else {
-                    continue;
+                let result = match msg {
+                    SipMessage::Request(req) => {
+                        dispatch_request(
+                            &socket,
+                            &redis,
+                            &router,
+                            &cfg,
+                            &forward_table,
+                            &dialog_table,
+                            &transaction_table,
+                            peer,
+                            req,
+                        )
+                        .await
+                    }
+                    SipMessage::Response(resp) => {
+                        dispatch_response(
+                            &socket,
+                            &cfg,
+                            &forward_table,
+                            &dialog_table,
+                            &transaction_table,
+                            resp,
+                        )
+                        .await
+                    }
                 };
-                if let Err(e) = dispatch_request(
-                    &socket,
-                    &redis,
-                    &router,
-                    &cfg,
-                    peer,
-                    req,
-                )
-                .await
-                {
+                if let Err(e) = result {
                     tracing::warn!(%peer, "udp proxy: {e}");
                 }
             }
@@ -86,18 +120,48 @@ pub async fn run_udp_proxy(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     socket: &tokio::net::UdpSocket,
     redis: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    dialog_table: &DialogTable,
+    transaction_table: &TransactionTable,
     peer: SocketAddr,
-    req: Request,
+    mut req: Request,
 ) -> anyhow::Result<()> {
+    apply_rfc3581(&mut req, peer);
+    track_server_transaction(transaction_table, &req).await;
     match req.method {
-        Method::Invite => handle_invite(socket, redis, router, cfg, peer, req).await,
+        Method::Invite => {
+            handle_invite(
+                socket,
+                redis,
+                router,
+                cfg,
+                forward_table,
+                transaction_table,
+                peer,
+                req,
+            )
+            .await
+        }
         Method::Register => handle_register(socket, redis, cfg, peer, req).await,
-        Method::Bye | Method::Cancel => {
+        Method::Ack | Method::Bye | Method::Update => {
+            handle_dialog_request(
+                socket,
+                cfg,
+                forward_table,
+                transaction_table,
+                dialog_table,
+                peer,
+                req,
+            )
+            .await
+        }
+        Method::Cancel => {
             respond(socket, peer, &sip_response(&req, StatusCode::OK)).await;
             Ok(())
         }
@@ -105,7 +169,6 @@ async fn dispatch_request(
             respond(socket, peer, &sip_options_ok(&req)).await;
             Ok(())
         }
-        Method::Ack => Ok(()),
         _ => {
             respond(
                 socket,
@@ -118,11 +181,312 @@ async fn dispatch_request(
     }
 }
 
+async fn track_server_transaction(table: &TransactionTable, req: &Request) {
+    let Some(key) = TransactionKey::from_request(req) else {
+        return;
+    };
+    let tx_type = match req.method {
+        Method::Invite => TransactionType::ServerInvite,
+        _ => TransactionType::ServerNonInvite,
+    };
+    let (tx, _rx) = mpsc::channel(1);
+    table.write().await.insert(key, tx_type, tx);
+}
+
+async fn track_client_transaction(
+    table: &TransactionTable,
+    req: &Request,
+    tx_type: TransactionType,
+) {
+    let Some(key) = TransactionKey::from_request(req) else {
+        return;
+    };
+    let (tx, _rx) = mpsc::channel(1);
+    table.write().await.insert(key, tx_type, tx);
+}
+
+async fn remove_client_transaction(table: &TransactionTable, resp: &Response) {
+    if resp.status.class() < 2 {
+        return;
+    }
+    let Some(key) = transaction_key_from_response(resp) else {
+        return;
+    };
+    table.write().await.remove(&key);
+}
+
+fn transaction_key_from_response(resp: &Response) -> Option<TransactionKey> {
+    let via = response_top_via(resp)?;
+    Some(TransactionKey {
+        branch: via.branch.clone(),
+        sent_by: sent_by(via),
+        method: resp.cseq()?.method.as_str().to_string(),
+    })
+}
+
+fn sent_by(via: &Via) -> String {
+    match via.port {
+        Some(port) => format!("{}:{port}", via.host),
+        None => via.host.clone(),
+    }
+}
+
+fn apply_rfc3581(req: &mut Request, peer: SocketAddr) {
+    let Some(via) = top_via_mut(&mut req.headers) else {
+        return;
+    };
+    let via_ip = via.host.parse::<IpAddr>().ok();
+    if via_ip != Some(peer.ip()) {
+        via.received = Some(peer.ip().to_string());
+    }
+    if matches!(via.rport, sipora_sip::types::header::RportParam::Requested) {
+        via.rport = sipora_sip::types::header::RportParam::Filled(peer.port());
+    }
+}
+
+fn top_via_mut(headers: &mut [Header]) -> Option<&mut Via> {
+    headers.iter_mut().find_map(|header| match header {
+        Header::Via(via) => Some(via),
+        _ => None,
+    })
+}
+
+async fn dispatch_response(
+    socket: &tokio::net::UdpSocket,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    dialog_table: &DialogTable,
+    transaction_table: &TransactionTable,
+    mut resp: Response,
+) -> anyhow::Result<()> {
+    let Some(top_via) = response_top_via(&resp) else {
+        return Ok(());
+    };
+    if !via_matches_proxy(top_via, &cfg.advertise, cfg.sip_port) {
+        return Ok(());
+    }
+    let branch = top_via.branch.clone();
+    if branch.is_empty() {
+        return Ok(());
+    }
+    remove_client_transaction(transaction_table, &resp).await;
+
+    let pending = get_pending_forward(forward_table, &branch).await;
+    if should_try_next_fork(&resp, pending.as_ref()) {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let _ = prepare_response(forward_table, &branch, &mut resp).await;
+        return forward_next_fork(socket, cfg, forward_table, transaction_table, pending).await;
+    }
+
+    let first_success = pending
+        .as_ref()
+        .is_some_and(|p| resp.status.is_success() && !p.final_forwarded);
+    let Some(mut target) = prepare_response(forward_table, &branch, &mut resp).await else {
+        return Ok(());
+    };
+    if let Some(via) = response_top_via(&resp) {
+        target = response_relay_addr(via).unwrap_or(target);
+    }
+    if first_success && let Some(pending) = pending {
+        let _ = insert_dialog_from_response(
+            dialog_table,
+            &resp,
+            pending.client_addr,
+            pending.target_addr,
+        )
+        .await;
+    }
+    let bytes = serialize_message(&SipMessage::Response(resp));
+    socket.send_to(&bytes, target).await?;
+    Ok(())
+}
+
+fn should_try_next_fork(resp: &Response, pending: Option<&PendingForward>) -> bool {
+    resp.status.class() >= 3
+        && pending
+            .as_ref()
+            .is_some_and(|p| !p.remaining_targets.is_empty())
+}
+
+async fn forward_next_fork(
+    socket: &tokio::net::UdpSocket,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    pending: PendingForward,
+) -> anyhow::Result<()> {
+    let Some(original_request) = pending.original_request.clone() else {
+        return Ok(());
+    };
+    for (index, target_uri) in pending.remaining_targets.iter().enumerate() {
+        let Some(target) = resolve_udp_target(target_uri).await else {
+            continue;
+        };
+        let remaining = pending
+            .remaining_targets
+            .iter()
+            .skip(index + 1)
+            .cloned()
+            .collect();
+        return forward_invite_request(
+            socket,
+            forward_table,
+            transaction_table,
+            pending.client_addr,
+            original_request.clone(),
+            target_uri.clone(),
+            target,
+            Some(original_request),
+            remaining,
+            &cfg.advertise,
+            cfg.sip_port,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+fn response_top_via(resp: &Response) -> Option<&Via> {
+    resp.headers.iter().find_map(|header| match header {
+        Header::Via(via) => Some(via),
+        _ => None,
+    })
+}
+
+fn via_matches_proxy(via: &Via, advertise: &str, sip_port: u16) -> bool {
+    via.host == advertise && via.port.unwrap_or(5060) == sip_port
+}
+
+fn response_relay_addr(via: &Via) -> Option<SocketAddr> {
+    let host = via.received.as_deref().unwrap_or(&via.host);
+    let port = match via.rport {
+        sipora_sip::types::header::RportParam::Filled(port) => port,
+        _ => via.port.unwrap_or(5060),
+    };
+    format!("{host}:{port}").parse().ok()
+}
+
+async fn handle_dialog_request(
+    socket: &tokio::net::UdpSocket,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    dialog_table: &DialogTable,
+    peer: SocketAddr,
+    mut req: Request,
+) -> anyhow::Result<()> {
+    let Some((_, state)) = dialog_for_request(dialog_table, &req).await else {
+        if req.method != Method::Ack {
+            respond(
+                socket,
+                peer,
+                &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
+            )
+            .await;
+        }
+        return Ok(());
+    };
+    tracing::trace!(
+        cseq = state.cseq,
+        caller = %state.caller_addr,
+        callee = %state.callee_addr,
+        session_expires = ?state.session_expires,
+        "routing in-dialog request"
+    );
+    let target_uri = dialog_target_uri(&mut req, &state, cfg);
+    let Some(target) = resolve_udp_target(&target_uri).await else {
+        respond(
+            socket,
+            peer,
+            &sip_response(&req, StatusCode::SERVICE_UNAVAILABLE),
+        )
+        .await;
+        return Ok(());
+    };
+    forward_dialog_request(
+        socket,
+        forward_table,
+        transaction_table,
+        peer,
+        req,
+        target_uri,
+        target,
+        cfg,
+    )
+    .await
+}
+
+fn dialog_target_uri(req: &mut Request, state: &DialogState, cfg: &UdpProxyConfig) -> String {
+    let own_route = format!("sip:{}:{}", cfg.advertise, cfg.sip_port);
+    strip_own_route(&mut req.headers, &own_route);
+    let target = next_route_uri(&req.headers)
+        .or_else(|| state.route_set.first().cloned())
+        .unwrap_or_else(|| state.remote_target.clone());
+    strip_name_addr(&target).to_string()
+}
+
+fn strip_own_route(headers: &mut Vec<Header>, own_route: &str) {
+    let Some(index) = headers.iter().position(|h| matches!(h, Header::Route(_))) else {
+        return;
+    };
+    let Header::Route(routes) = &mut headers[index] else {
+        return;
+    };
+    if routes
+        .first()
+        .is_some_and(|route| route.contains(own_route))
+    {
+        routes.remove(0);
+    }
+    if routes.is_empty() {
+        headers.remove(index);
+    }
+}
+
+fn next_route_uri(headers: &[Header]) -> Option<String> {
+    headers.iter().find_map(|header| match header {
+        Header::Route(routes) => routes.first().cloned(),
+        _ => None,
+    })
+}
+
+fn strip_name_addr(uri: &str) -> &str {
+    uri.trim().trim_start_matches('<').trim_end_matches('>')
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_dialog_request(
+    socket: &tokio::net::UdpSocket,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    peer: SocketAddr,
+    mut req: Request,
+    target_uri: String,
+    target: SocketAddr,
+    cfg: &UdpProxyConfig,
+) -> anyhow::Result<()> {
+    req.uri = target_uri;
+    let branch = prepend_proxy_via(&mut req, &cfg.advertise, cfg.sip_port);
+    if req.method != Method::Ack {
+        track_client_transaction(transaction_table, &req, TransactionType::ClientNonInvite).await;
+        let vias = collect_via_stack(&req.headers);
+        insert_forward(forward_table, branch, peer, target, vias, None, vec![]).await;
+    }
+    let bytes = serialize_message(&SipMessage::Request(req));
+    socket.send_to(&bytes, target).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_invite(
     socket: &tokio::net::UdpSocket,
     pool: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
     peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<()> {
@@ -167,7 +531,14 @@ async fn handle_invite(
         .await;
         return Ok(());
     }
+    let mut contacts = contacts;
+    contacts.sort_by(|a, b| {
+        b.q_value
+            .partial_cmp(&a.q_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let target_uri = contacts[0].uri.clone();
+    let remaining_targets = contacts.iter().skip(1).map(|c| c.uri.clone()).collect();
     let Some(target) = resolve_udp_target(&target_uri).await else {
         respond(
             socket,
@@ -177,43 +548,94 @@ async fn handle_invite(
         .await;
         return Ok(());
     };
+    let original_request = req.clone();
     forward_invite_request(
         socket,
+        forward_table,
+        transaction_table,
+        peer,
         req,
         target_uri,
         target,
+        Some(original_request),
+        remaining_targets,
         &cfg.advertise,
         cfg.sip_port,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_invite_request(
     socket: &tokio::net::UdpSocket,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    peer: SocketAddr,
     mut req: Request,
     target_uri: String,
     target: SocketAddr,
+    original_request: Option<Request>,
+    remaining_targets: Vec<String>,
     advertise: &str,
     sip_port: u16,
 ) -> anyhow::Result<()> {
     req.uri = target_uri;
     let branch = format!("z9hG4bK{}", Uuid::new_v4().as_simple());
+    let original_via_stack = collect_via_stack(&req.headers);
     let via = Header::Via(Via {
         transport: Transport::Udp,
         host: advertise.to_string(),
         port: Some(sip_port),
-        branch,
+        branch: branch.clone(),
         received: None,
         rport: sipora_sip::types::header::RportParam::Absent,
         params: vec![],
     });
-    let mut headers = vec![via];
+    let record_route = Header::RecordRoute(vec![format!("<sip:{advertise}:{sip_port};lr>")]);
+    let mut headers = vec![via, record_route];
     headers.extend(req.headers);
     req.headers = headers;
     ProxyRouter::decrement_max_forwards(&mut req.headers);
+    track_client_transaction(transaction_table, &req, TransactionType::ClientInvite).await;
+    insert_forward(
+        forward_table,
+        branch,
+        peer,
+        target,
+        original_via_stack,
+        original_request,
+        remaining_targets,
+    )
+    .await;
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
     Ok(())
+}
+
+fn prepend_proxy_via(req: &mut Request, advertise: &str, sip_port: u16) -> String {
+    let branch = format!("z9hG4bK{}", Uuid::new_v4().as_simple());
+    let via = Header::Via(Via {
+        transport: Transport::Udp,
+        host: advertise.to_string(),
+        port: Some(sip_port),
+        branch: branch.clone(),
+        received: None,
+        rport: sipora_sip::types::header::RportParam::Absent,
+        params: vec![],
+    });
+    req.headers.insert(0, via);
+    ProxyRouter::decrement_max_forwards(&mut req.headers);
+    branch
+}
+
+fn collect_via_stack(headers: &[Header]) -> Vec<Via> {
+    headers
+        .iter()
+        .filter_map(|header| match header {
+            Header::Via(via) => Some(via.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn normalize_domain(dom: String, fallback: &str) -> String {
@@ -731,25 +1153,250 @@ fn parse_sip_user_host(uri: &str) -> Option<(String, String)> {
     let u = uri.trim();
     let u = u.strip_prefix("sip:").or_else(|| u.strip_prefix("sips:"))?;
     let u = u.split(';').next()?.split('?').next()?;
-    let at = u.find('@')?;
-    let user = u[..at].to_string();
-    let rest = u[at + 1..].to_string();
-    Some((user, rest))
+    if u.is_empty() {
+        return None;
+    }
+
+    let (user, rest) = match u.find('@') {
+        Some(at) => (&u[..at], &u[at + 1..]),
+        None => ("", u),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+
+    Some((user.to_string(), rest.to_string()))
 }
 
 async fn resolve_udp_target(contact_uri: &str) -> Option<SocketAddr> {
     let (_, hostport) = parse_sip_user_host(contact_uri)?;
     let (host, port) = split_host_port(&hostport)?;
-    let mut it = tokio::net::lookup_host((host.as_str(), port)).await.ok()?;
-    it.next()
+    resolve_sip_targets(&host, Some(port), SipTransport::Udp)
+        .await
+        .into_iter()
+        .next()
+        .map(|target| target.addr)
 }
 
 fn split_host_port(rest: &str) -> Option<(String, u16)> {
+    if let Some(stripped) = rest.strip_prefix('[') {
+        let bracket_end = stripped.find(']')?;
+        let host = &stripped[..bracket_end];
+        let after_bracket = &stripped[bracket_end + 1..];
+        let port = match after_bracket.strip_prefix(':') {
+            Some(port) => port.parse::<u16>().ok()?,
+            None if after_bracket.is_empty() => 5060,
+            None => return None,
+        };
+        return Some((host.to_string(), port));
+    }
+
     match rest.rsplit_once(':') {
         Some((h, p)) => match p.parse::<u16>() {
             Ok(port) => Some((h.to_string(), port)),
             Err(_) => Some((rest.to_string(), 5060)),
         },
         None => Some((rest.to_string(), 5060)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forward_table::{PendingForward, new_forward_table};
+    use sipora_sip::types::header::{CSeq, NameAddr, RportParam};
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Instant;
+
+    #[test]
+    fn parse_sip_user_host_accepts_ipv6_literal_without_user() {
+        let parsed = parse_sip_user_host("sip:[2001:db8::1]:5070");
+
+        assert_eq!(
+            parsed,
+            Some(("".to_string(), "[2001:db8::1]:5070".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_sip_user_host_accepts_sips_with_parameters() {
+        let parsed = parse_sip_user_host("sips:alice@example.com;transport=tls");
+
+        assert_eq!(
+            parsed,
+            Some(("alice".to_string(), "example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_host_port_strips_ipv6_brackets_with_port() {
+        let parsed = split_host_port("[2001:db8::1]:5070");
+
+        assert_eq!(parsed, Some(("2001:db8::1".to_string(), 5070)));
+    }
+
+    #[test]
+    fn split_host_port_strips_ipv6_brackets_without_port() {
+        let parsed = split_host_port("[2001:db8::1]");
+
+        assert_eq!(parsed, Some(("2001:db8::1".to_string(), 5060)));
+    }
+
+    #[test]
+    fn apply_rfc3581_fills_received_and_requested_rport() {
+        let peer = "127.0.0.1:5090".parse().unwrap();
+        let mut req = invite_request();
+        let Header::Via(via) = &mut req.headers[0] else {
+            panic!("first header should be Via");
+        };
+        via.host = "10.0.0.10".to_string();
+        via.rport = RportParam::Requested;
+
+        apply_rfc3581(&mut req, peer);
+
+        let via = req.via()[0];
+        assert_eq!(via.received.as_deref(), Some("127.0.0.1"));
+        assert_eq!(via.rport, RportParam::Filled(5090));
+    }
+
+    #[test]
+    fn response_relay_addr_prefers_received_and_rport() {
+        let mut req = invite_request();
+        let Header::Via(via) = &mut req.headers[0] else {
+            panic!("first header should be Via");
+        };
+        via.received = Some("127.0.0.1".to_string());
+        via.rport = RportParam::Filled(5091);
+
+        assert_eq!(
+            response_relay_addr(via),
+            Some("127.0.0.1:5091".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_invite_inserts_pending_forward() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let peer = "127.0.0.1:5090".parse().unwrap();
+        let table = new_forward_table();
+        let transaction_table = new_transaction_table();
+
+        forward_invite_request(
+            &socket,
+            &table,
+            &transaction_table,
+            peer,
+            invite_request(),
+            "sip:bob@127.0.0.1:5091".to_string(),
+            target_addr,
+            Some(invite_request()),
+            vec![],
+            "proxy.example.com",
+            5060,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = target.recv_from(&mut buf).await.unwrap();
+        let (_, msg) = parse_sip_message(&buf[..n]).unwrap();
+        let SipMessage::Request(forwarded) = msg else {
+            panic!("forwarded INVITE must remain a request");
+        };
+        let branch = forwarded.via()[0].branch.clone();
+        let forwards = table.read().await;
+        assert_eq!(forwards[&branch].client_addr, peer);
+        assert_eq!(forwards[&branch].original_via_stack.len(), 1);
+        assert!(forwarded.headers.iter().any(|header| {
+            matches!(header, Header::RecordRoute(routes) if routes[0].contains(";lr"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn forward_next_fork_sends_invite_to_remaining_target() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let table = new_forward_table();
+        let cfg = test_cfg();
+        let pending = PendingForward {
+            client_addr: "127.0.0.1:5090".parse().unwrap(),
+            target_addr,
+            original_via_stack: vec![],
+            original_request: Some(invite_request()),
+            remaining_targets: vec![format!("sip:bob@{target_addr}")],
+            final_forwarded: false,
+            inserted_at: Instant::now(),
+        };
+
+        let transaction_table = new_transaction_table();
+        forward_next_fork(&socket, &cfg, &table, &transaction_table, pending)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = target.recv_from(&mut buf).await.unwrap();
+        let (_, msg) = parse_sip_message(&buf[..n]).unwrap();
+        assert!(matches!(msg, SipMessage::Request(_)));
+        assert_eq!(table.read().await.len(), 1);
+    }
+
+    fn test_cfg() -> UdpProxyConfig {
+        UdpProxyConfig {
+            domain: "example.com".to_string(),
+            advertise: "proxy.example.com".to_string(),
+            sip_port: 5060,
+            max_forwards: 70,
+            registrar: RegistrarLimits {
+                min_expires: 60,
+                max_expires: 3600,
+                default_expires: 300,
+            },
+            nonce_ttl_s: 120,
+            pg: PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/sipora")
+                .unwrap(),
+        }
+    }
+
+    fn invite_request() -> Request {
+        Request {
+            method: Method::Invite,
+            uri: "sip:bob@example.com".to_string(),
+            version: SipVersion::V2_0,
+            headers: vec![
+                Header::Via(Via {
+                    transport: Transport::Udp,
+                    host: "client.example.com".to_string(),
+                    port: Some(5060),
+                    branch: "z9hG4bK-client".to_string(),
+                    received: None,
+                    rport: RportParam::Absent,
+                    params: vec![],
+                }),
+                Header::From(NameAddr {
+                    display_name: None,
+                    uri: "sip:alice@example.com".to_string(),
+                    tag: Some("from-tag".to_string()),
+                    params: vec![],
+                }),
+                Header::To(NameAddr {
+                    display_name: None,
+                    uri: "sip:bob@example.com".to_string(),
+                    tag: None,
+                    params: vec![],
+                }),
+                Header::CallId("call-1".to_string()),
+                Header::CSeq(CSeq {
+                    seq: 1,
+                    method: Method::Invite,
+                }),
+                Header::MaxForwards(70),
+                Header::ContentLength(0),
+            ],
+            body: Vec::new(),
+        }
     }
 }

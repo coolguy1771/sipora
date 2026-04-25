@@ -18,3 +18,5 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 sipora-sip = { workspace = true }
 sipora-core = { workspace = true }
+hickory-resolver = { workspace = true }
+moka = { workspace = true }

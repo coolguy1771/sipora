@@ -69,6 +69,7 @@ impl WebSocketConnection {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         while let Some(msg) = self.inner.next().await {
             match msg {
+                Ok(Message::Text(text)) if text == "\r\n" || text == "\r\n\r\n" => continue,
                 Ok(Message::Text(text)) => return Some(text.as_bytes().to_vec()),
                 Ok(Message::Binary(bin)) => return Some(bin.to_vec()),
                 Ok(Message::Close(_)) => return None,
@@ -170,5 +171,36 @@ mod tests {
 
         assert!(accepted.is_ok());
         assert_eq!(response.headers()["Sec-WebSocket-Protocol"], "sip");
+    }
+
+    #[tokio::test]
+    async fn recv_skips_crlf_keepalive_text_frames() {
+        let transport = WebSocketTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = transport.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = transport.accept().await.unwrap();
+            connection.recv().await
+        });
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+        let (mut client, _) = connect_async(request).await.unwrap();
+
+        client.send(Message::Text("\r\n".into())).await.unwrap();
+        client
+            .send(Message::Text(
+                "OPTIONS sip:example.com SIP/2.0\r\n\r\n".into(),
+            ))
+            .await
+            .unwrap();
+
+        let received = server.await.unwrap();
+        assert_eq!(
+            received,
+            Some(b"OPTIONS sip:example.com SIP/2.0\r\n\r\n".to_vec())
+        );
     }
 }

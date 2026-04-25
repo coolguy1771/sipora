@@ -100,6 +100,8 @@ base64 = "0.22"
 md-5 = "0.11"
 hex = "0.4"
 url = "2"
+hickory-resolver = "0.26.0"
+moka = { version = "0.12.15", features = ["future"] }
 
 # Workspace crates
 sipora-core = { path = "crates/sipora-core" }
