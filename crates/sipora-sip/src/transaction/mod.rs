@@ -36,8 +36,12 @@ impl TransactionKey {
     pub fn from_request(req: &Request) -> Option<Self> {
         let vias = req.via();
         let via = vias.first()?;
+        let branch = via.branch.clone();
+        if branch.is_empty() || !branch.starts_with("z9hG4bK") {
+            return None;
+        }
         Some(Self {
-            branch: via.branch.clone(),
+            branch,
             sent_by: sent_by(via),
             method: req.method.as_str().to_owned(),
         })
@@ -62,3 +66,43 @@ pub const TIMER_I: Duration = Duration::from_secs(5);
 pub const TIMER_J: Duration = Duration::from_secs(32);
 pub const TIMER_K: Duration = Duration::from_secs(5);
 pub const TIMER_L: Duration = TIMER_B;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::header::{Header, RportParam, Transport};
+    use crate::types::message::SipVersion;
+    use crate::types::method::Method;
+
+    fn request_with_branch(branch: &str) -> Request {
+        Request {
+            method: Method::Invite,
+            uri: "sip:bob@example.com".to_owned(),
+            version: SipVersion::V2_0,
+            headers: vec![Header::Via(Via {
+                transport: Transport::Udp,
+                host: "client.example.com".to_owned(),
+                port: Some(5060),
+                branch: branch.to_owned(),
+                received: None,
+                rport: RportParam::Absent,
+                params: vec![],
+            })],
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn transaction_key_rejects_empty_branch() {
+        let req = request_with_branch("");
+
+        assert!(TransactionKey::from_request(&req).is_none());
+    }
+
+    #[test]
+    fn transaction_key_rejects_branch_without_magic_cookie() {
+        let req = request_with_branch("legacy-branch");
+
+        assert!(TransactionKey::from_request(&req).is_none());
+    }
+}

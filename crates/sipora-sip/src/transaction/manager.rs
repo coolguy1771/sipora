@@ -104,8 +104,8 @@ mod tests {
         assert_ne!(key_a.sent_by, key_b.sent_by);
     }
 
-    #[tokio::test]
-    async fn manager_keeps_colliding_branches_from_different_sent_by_values() {
+    #[test]
+    fn manager_keeps_colliding_branches_from_different_sent_by_values() {
         let mut manager = TransactionManager::new();
         let (tx_a, _rx_a) = mpsc::channel(1);
         let (tx_b, _rx_b) = mpsc::channel(1);
