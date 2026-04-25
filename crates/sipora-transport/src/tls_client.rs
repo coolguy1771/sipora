@@ -71,7 +71,13 @@ impl TlsClientPool {
             let stream = inner
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("TLS stream missing after connect"))?;
-            if stream.write_all(data).await.is_ok() {
+            let write_ok = stream.write_all(data).await.is_ok();
+            let flush_ok = if write_ok {
+                stream.flush().await.is_ok()
+            } else {
+                false
+            };
+            if write_ok && flush_ok {
                 return Ok(());
             }
             *inner = None;
