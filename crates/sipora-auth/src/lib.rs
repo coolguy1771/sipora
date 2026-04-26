@@ -1,6 +1,7 @@
 pub mod digest;
 pub mod jwt;
 pub mod nonce;
+pub mod stir;
 pub mod turn;
 
 use thiserror::Error;

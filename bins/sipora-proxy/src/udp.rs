@@ -2,15 +2,16 @@
 //! see `AGENTS.md` ("SIP signaling scope") and `docs/qualification.md` for end-to-end INVITE paths.
 
 use fred::prelude::{Expiration, KeysInterface, LuaInterface, SetOptions};
-use sipora_auth::digest::{DigestChallenge, DigestResponse, verify_digest};
+use sipora_auth::digest::{DigestChallenge, DigestResponse, validate_nc, verify_digest};
 use sipora_core::redis::RedisPool;
 use sipora_core::redis_keys::{
-    LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH, register_commit_lock_key, register_digest_nonce_key,
-    register_transaction_ok_key,
+    LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH, register_commit_lock_key,
+    register_digest_nonce_key, register_digest_nonce_nc_key, register_transaction_ok_key,
 };
 use sipora_data::pg::get_user_sip_digest_ha1;
 use sipora_location::ContactBinding;
 use sipora_location::redis_store::{list_contact_uris, upsert_contact};
+use sipora_sip::overload::overload_response;
 use sipora_sip::parser::message::parse_sip_message;
 use sipora_sip::serialize::serialize_message;
 use sipora_sip::transaction::TransactionKey;
@@ -423,7 +424,7 @@ async fn handle_dialog_request(
         respond(
             socket,
             peer,
-            &sip_response(&req, StatusCode::SERVICE_UNAVAILABLE),
+            &overload_response(&req, 30),
         )
         .await;
         return Ok(());
@@ -842,7 +843,8 @@ fn sip_options_ok(req: &Request) -> SipMessage {
     })
 }
 
-fn sip_response_www_auth(req: &Request, www: &str) -> SipMessage {
+/// Build a 401 with multiple WWW-Authenticate headers (RFC 8760 dual-algorithm challenge).
+fn sip_response_multi_www_auth(req: &Request, challenges: &[String]) -> SipMessage {
     let mut headers = Vec::new();
     for h in &req.headers {
         match h {
@@ -854,7 +856,9 @@ fn sip_response_www_auth(req: &Request, www: &str) -> SipMessage {
             _ => {}
         }
     }
-    headers.push(Header::WwwAuthenticate(www.to_owned()));
+    for ch in challenges {
+        headers.push(Header::WwwAuthenticate(ch.clone()));
+    }
     headers.push(Header::ContentLength(0));
     SipMessage::Response(Response {
         version: SipVersion::V2_0,
@@ -1107,24 +1111,34 @@ async fn register_send_digest_challenge(
     req: &Request,
     realm: &str,
 ) -> anyhow::Result<()> {
-    let nonce = Uuid::new_v4().simple().to_string();
-    if let Err(e) = store_register_nonce(redis, &nonce, cfg.nonce_ttl_s).await {
-        tracing::warn!(%e, "register nonce");
-        respond(
-            socket,
-            peer,
-            &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
-        )
-        .await;
-        return Ok(());
+    register_send_digest_challenge_stale(socket, redis, cfg, peer, req, realm, false).await
+}
+
+/// RFC 8760: send two challenges (SHA-256 preferred, MD5 for legacy UAs).
+/// RFC 2617: set stale=TRUE when re-challenging after a nonce expiry.
+async fn register_send_digest_challenge_stale(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    realm: &str,
+    stale: bool,
+) -> anyhow::Result<()> {
+    let nonce_sha256 = Uuid::new_v4().simple().to_string();
+    let nonce_md5 = Uuid::new_v4().simple().to_string();
+    for nonce in [&nonce_sha256, &nonce_md5] {
+        if let Err(e) = store_register_nonce(redis, nonce, cfg.nonce_ttl_s).await {
+            tracing::warn!(%e, "register nonce store");
+            respond(socket, peer, &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR)).await;
+            return Ok(());
+        }
     }
-    let ch = DigestChallenge::new(realm, &nonce);
-    respond(
-        socket,
-        peer,
-        &sip_response_www_auth(req, &ch.to_www_authenticate()),
-    )
-    .await;
+    let challenges = [
+        DigestChallenge::new_sha256(realm, &nonce_sha256).with_stale(stale).to_www_authenticate(),
+        DigestChallenge::new_md5(realm, &nonce_md5).with_stale(stale).to_www_authenticate(),
+    ];
+    respond(socket, peer, &sip_response_multi_www_auth(req, &challenges)).await;
     Ok(())
 }
 
@@ -1159,8 +1173,9 @@ async fn register_digest_commit_after_lock(
     }
     match register_nonce_exists(redis, &dr.nonce).await {
         Ok(false) => {
-            respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-            Ok(())
+            // Nonce expired (TTL elapsed) — re-challenge with stale=TRUE so the UA
+            // retries with a fresh nonce without prompting for credentials (RFC 2617 §3.3).
+            register_send_digest_challenge_stale(socket, redis, cfg, peer, req, dom, true).await
         }
         Ok(true) => {
             register_commit_digest(
@@ -1170,12 +1185,7 @@ async fn register_digest_commit_after_lock(
         }
         Err(e) => {
             tracing::warn!(%e, "register redis (nonce exists)");
-            respond(
-                socket,
-                peer,
-                &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
-            )
-            .await;
+            respond(socket, peer, &overload_response(req, 30)).await;
             Ok(())
         }
     }
@@ -1202,7 +1212,7 @@ async fn register_try_acquire_commit_lock(
             respond(
                 socket,
                 peer,
-                &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+                &overload_response(req, 30),
             )
             .await;
             return Ok(None);
@@ -1222,7 +1232,7 @@ async fn register_try_acquire_commit_lock(
                     respond(
                         socket,
                         peer,
-                        &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+                        &overload_response(req, 30),
                     )
                     .await;
                 }
@@ -1231,7 +1241,7 @@ async fn register_try_acquire_commit_lock(
                     respond(
                         socket,
                         peer,
-                        &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+                        &overload_response(req, 30),
                     )
                     .await;
                 }
@@ -1243,7 +1253,7 @@ async fn register_try_acquire_commit_lock(
             respond(
                 socket,
                 peer,
-                &sip_response(req, StatusCode::SERVICE_UNAVAILABLE),
+                &overload_response(req, 30),
             )
             .await;
             return Ok(None);
@@ -1332,6 +1342,31 @@ async fn register_commit_digest(
         }
         respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
         return Ok(());
+    }
+
+    // RFC 7616 §3.4: enforce nc strictly increases to prevent replay within a nonce lifetime.
+    if let Some(nc_new) = dr.nc_as_u64() {
+        let nc_key = register_digest_nonce_nc_key(&dr.nonce);
+        let nc_prev: u64 = match redis.get::<Option<String>, _>(&nc_key).await {
+            Ok(Some(s)) => s.parse().unwrap_or(0),
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::warn!(%e, "register redis (nc get)");
+                respond(socket, peer, &overload_response(req, 30)).await;
+                return Ok(());
+            }
+        };
+        if let Err(nc_err) = validate_nc(nc_new, nc_prev) {
+            tracing::warn!(?nc_err, nonce = %dr.nonce, "register nc replay");
+            if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
+                tracing::warn!(%e, "register invalidate nonce (nc replay)");
+            }
+            respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+            return Ok(());
+        }
+        let _: Result<Option<String>, _> = redis
+            .set(&nc_key, nc_new.to_string(), Some(Expiration::EX(cfg.nonce_ttl_s.max(1) as i64)), None, false)
+            .await;
     }
 
     if let Err(e) = upsert_contact(redis, dom, user, binding, expires as i64).await {

@@ -15,6 +15,7 @@ pub enum OaError {
 }
 
 /// Offer/answer state (RFC 3264 §4).
+#[allow(clippy::large_enum_variant)]
 pub enum OaState {
     Idle,
     LocalOffer(Session),
@@ -53,7 +54,9 @@ impl OfferAnswerMachine {
     }
 
     /// Record a remote answer to our pending local offer; transitions to Stable.
-    pub fn apply_remote_answer(&mut self, answer: Session) -> Result<Session, OaError> {
+    ///
+    /// Read the stored answer with [`active_remote`](Self::active_remote) if you need the SDP.
+    pub fn apply_remote_answer(&mut self, answer: Session) -> Result<(), OaError> {
         let offer = match std::mem::replace(&mut self.state, OaState::Idle) {
             OaState::LocalOffer(o) => o,
             other => {
@@ -65,9 +68,9 @@ impl OfferAnswerMachine {
         };
         self.state = OaState::Stable {
             local: offer,
-            remote: answer.clone(),
+            remote: answer,
         };
-        Ok(answer)
+        Ok(())
     }
 
     /// Record an incoming remote offer; transitions to RemoteOffer.
@@ -85,7 +88,9 @@ impl OfferAnswerMachine {
 
     /// Generate an SDP answer to the current remote offer and transition to Stable.
     ///
-    /// `caps` controls codec selection. Increments the local `o=` version on each call.
+    /// `caps` controls codec selection. Increments the local `o=` version only after a
+    /// successful negotiation. On failure the machine returns to [`OaState::RemoteOffer`]
+    /// with the same offer and the same version as before this call.
     pub fn generate_answer(&mut self, caps: &CodecCapabilities) -> Result<Session, OaError> {
         let offer = match std::mem::replace(&mut self.state, OaState::Idle) {
             OaState::RemoteOffer(o) => o,
@@ -94,9 +99,15 @@ impl OfferAnswerMachine {
                 return Err(OaError::NoOffer);
             }
         };
-        self.version += 1;
-        let answer = negotiate_sdp_answer(&offer, caps, self.version)
-            .map_err(|e| OaError::Negotiate(e.to_string()))?;
+        let next_ver = self.version + 1;
+        let answer = match negotiate_sdp_answer(&offer, caps, next_ver) {
+            Ok(a) => a,
+            Err(e) => {
+                self.state = OaState::RemoteOffer(offer);
+                return Err(OaError::Negotiate(e.to_string()));
+            }
+        };
+        self.version = next_ver;
         self.state = OaState::Stable {
             local: answer.clone(),
             remote: offer,
@@ -174,7 +185,6 @@ a=sendrecv\r\n";
         let mut m = OfferAnswerMachine::new();
         // Cannot call apply_remote_answer without a pending local offer
         let offer = parse_sdp(OFFER_SDP).unwrap();
-        let result = m.apply_remote_answer(offer);
-        assert!(result.is_err());
+        assert!(m.apply_remote_answer(offer).is_err());
     }
 }

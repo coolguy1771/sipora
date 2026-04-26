@@ -35,6 +35,12 @@ pub enum Header {
         refresher: Option<Refresher>,
     },
     MinSE(u32),
+    /// RFC 8224 STIR call identity token.
+    Identity(String),
+    /// RFC 3325 asserted identity (trusted network → proxy).
+    PAssertedIdentity(String),
+    /// RFC 3325 preferred identity hint (UA → proxy).
+    PPreferredIdentity(String),
     Extension {
         name: String,
         value: String,
@@ -154,6 +160,9 @@ impl Header {
             Self::RAck { .. } => "RAck",
             Self::SessionExpires { .. } => "Session-Expires",
             Self::MinSE(_) => "Min-SE",
+            Self::Identity(_) => "Identity",
+            Self::PAssertedIdentity(_) => "P-Asserted-Identity",
+            Self::PPreferredIdentity(_) => "P-Preferred-Identity",
             Self::Extension { name, .. } => name.as_str(),
         }
     }

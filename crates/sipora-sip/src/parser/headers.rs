@@ -80,6 +80,9 @@ fn match_header(name: &str, value: &[u8]) -> Header {
         "min-se" => parse_u32_val(value)
             .map(Header::MinSE)
             .unwrap_or_else(|| ext(name, value)),
+        "identity" => Header::Identity(trim_str(value)),
+        "p-asserted-identity" => Header::PAssertedIdentity(trim_str(value)),
+        "p-preferred-identity" => Header::PPreferredIdentity(trim_str(value)),
         _ => ext(name, value),
     }
 }

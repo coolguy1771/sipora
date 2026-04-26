@@ -48,11 +48,13 @@ impl CodecPolicy {
 /// `uac_leg` tracks the offer/answer state toward the user agent client (caller);
 /// `uas_leg` tracks the state toward the user agent server (callee / rtpengine).
 /// The two legs are independent — media is not simply forwarded between them.
+#[allow(dead_code)]
 pub struct B2buaDialog {
     pub uac_leg: sipora_sdp::offer_answer::OfferAnswerMachine,
     pub uas_leg: sipora_sdp::offer_answer::OfferAnswerMachine,
 }
 
+#[allow(dead_code)]
 impl B2buaDialog {
     pub fn new() -> Self {
         Self {

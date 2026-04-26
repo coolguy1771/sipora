@@ -8,6 +8,11 @@ pub fn register_digest_nonce_key(nonce: &str) -> String {
     format!("register_digest:{nonce}")
 }
 
+/// Last accepted nonce-count for a nonce (RFC 7616 nc replay prevention).
+pub fn register_digest_nonce_nc_key(nonce: &str) -> String {
+    format!("register_digest:{nonce}:nc")
+}
+
 /// Completed REGISTER (Call-ID + CSeq) for UDP idempotent 200 retransmits.
 pub fn register_transaction_ok_key(call_id: &str, cseq: u32) -> String {
     format!("register_tx_ok:{call_id}:{cseq}")

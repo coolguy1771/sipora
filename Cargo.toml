@@ -65,7 +65,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"] }
 
 # Crypto / Auth
 argon2 = "0.5"
-jsonwebtoken = "10.3"
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 hmac = "0.13"
 sha2 = "0.11"
 rand = "0.10"
@@ -100,6 +100,7 @@ bytes = "1"
 base64 = "0.22"
 md-5 = "0.11"
 hex = "0.4"
+x509-cert = { version = "0.2", features = ["pem"] }
 url = "2"
 hickory-resolver = "0.26.0"
 moka = { version = "0.12.15", features = ["future"] }

@@ -21,8 +21,14 @@ const PASSTHROUGH: &[&str] = &[
 
 /// Generate an SDP answer for `offer` intersecting with `caps`.
 ///
-/// Sets `o=` sess_version to `answer_version`.  All media sections from the offer
-/// are answered; sections where no codec matches have their port set to 0 (rejected).
+/// Sets `o=` sess_version to `answer_version`. All media sections from the offer are
+/// answered; sections where no codec matches have their port set to 0 (rejected).
+///
+/// **B2BUA / rtpengine assumption:** attributes listed in `PASSTHROUGH` (fingerprint, setup,
+/// ICE, candidates, etc.) are copied from offer to answer unchanged. This matches deployments
+/// where a media proxy such as **rtpengine** rewrites those fields on the wire; it is **not**
+/// safe for naive endpoint-to-endpoint SRTP negotiation (forwarding the offerer’s fingerprint
+/// would break DTLS). See the rtpengine-oriented contract in `bins/sipora-b2bua/src/codec.rs`.
 pub fn negotiate_sdp_answer(
     offer: &Session,
     caps: &CodecCapabilities,
@@ -51,7 +57,7 @@ fn negotiate_answer_media(offer_m: &Media, caps: &CodecCapabilities) -> Media {
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    let rtpmaps = collect_rtpmaps(&offer_m.attributes).unwrap_or_default();
+    let rtpmaps = collect_rtpmaps(&offer_m.attributes);
 
     let accepted = select_codecs(&offered_pts, &rtpmaps, caps);
     let port = if accepted.is_empty() { 0 } else { offer_m.port };
@@ -137,10 +143,10 @@ fn select_codecs(
         if let Some((pt, _, _)) = rtpmaps
             .iter()
             .find(|(_, name, rate)| name.eq_ignore_ascii_case(&cap.name) && *rate == cap.clock_rate)
+            && offered_pts.contains(pt)
+            && !accepted.contains(pt)
         {
-            if offered_pts.contains(pt) && !accepted.contains(pt) {
-                accepted.push(*pt);
-            }
+            accepted.push(*pt);
         }
     }
 
@@ -158,16 +164,12 @@ fn select_codecs(
 
     // Phase 3: static PTs (no rtpmap line) — PCMU=0, PCMA=8, G722=9, etc.
     for &pt in offered_pts {
-        if accepted.contains(&pt) {
-            continue;
-        }
-        if rtpmaps.iter().any(|(p, _, _)| *p == pt) {
-            continue;
-        } // has rtpmap
-        if let Some((name, rate)) = static_codec_for_pt(pt) {
-            if caps.allows(name, rate) {
-                accepted.push(pt);
-            }
+        if !accepted.contains(&pt)
+            && !rtpmaps.iter().any(|(p, _, _)| *p == pt)
+            && let Some((name, rate)) = static_codec_for_pt(pt)
+            && caps.allows(name, rate)
+        {
+            accepted.push(pt);
         }
     }
 
@@ -279,7 +281,9 @@ a=sendrecv\r\n";
     #[test]
     fn telephone_event_preserved_in_answer() {
         let offer = parse_sdp(OFFER_TELEPHONE_EVENT).unwrap();
-        let caps = CodecCapabilities::new(vec![RtpCodec::new("opus", 48000).with_channels(2)]);
+        let caps = CodecCapabilities::new(vec![RtpCodec::new("opus", 48000).with_channels(2)])
+            .with_telephone_event(true);
+        assert!(caps.support_telephone_event());
         let answer = negotiate_sdp_answer(&offer, &caps, 1).unwrap();
         let m = &answer.medias[0];
         let pts: Vec<&str> = m.fmt.split_whitespace().collect();
