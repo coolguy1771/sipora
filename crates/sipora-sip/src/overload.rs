@@ -76,7 +76,7 @@ mod tests {
             .headers
             .iter()
             .any(|h| matches!(h, Header::RetryAfter(30)));
-        assert!(has_retry, "Retry-After: 30 must be present per RFC 7339");
+        assert!(has_retry, "Retry-After: 30 must be present per RFC 3261 §21.5.4");
     }
 
     #[test]

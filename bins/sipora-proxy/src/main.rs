@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         },
         nonce_ttl_s: nonce_ttl,
         pg,
-        stir: udp::StirConfig::default(),
+        stir: build_stir_config(&config.stir),
     };
     let forward_table = forward_table::new_forward_table();
     let dialog_table = dialog::new_dialog_table();
@@ -107,4 +107,30 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     tracing::info!("shutting down");
     Ok(())
+}
+
+fn build_stir_config(cfg: &sipora_core::config::StirConfig) -> udp::StirConfig {
+    use std::net::IpAddr;
+    let mode = match cfg.mode.as_str() {
+        "permissive" => udp::StirMode::Permissive,
+        "strict" => udp::StirMode::Strict,
+        _ => udp::StirMode::Disabled,
+    };
+    let trusted_peer_ips: Vec<IpAddr> = cfg
+        .trusted_peer_ips
+        .iter()
+        .filter_map(|s| {
+            s.parse::<IpAddr>()
+                .map_err(|e| tracing::warn!(ip = %s, "stir: invalid trusted_peer_ip: {e}"))
+                .ok()
+        })
+        .collect();
+    if !matches!(mode, udp::StirMode::Disabled) {
+        tracing::info!(mode = %cfg.mode, peers = trusted_peer_ips.len(), "STIR/SHAKEN verification enabled");
+    }
+    udp::StirConfig {
+        mode,
+        trusted_peer_ips,
+        cert_cache: sipora_auth::stir::CertCache::new(),
+    }
 }

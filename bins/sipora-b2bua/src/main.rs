@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         sip_port,
         policy: codec::CodecPolicy::new(config.media.allowed_codecs.clone()),
         router: routing::ProxyRouter::new(config.proxy.max_forwards),
-        stir: None, // disabled by default; set via config when STI-AS credentials are available
+        stir: build_b2bua_stir(&config.stir)?,
     };
 
     let ready = AtomicReady::new();
@@ -88,6 +88,25 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     tracing::info!("shutting down");
     Ok(())
+}
+
+fn build_b2bua_stir(cfg: &sipora_core::config::StirConfig) -> Result<Option<udp::B2buaStirConfig>> {
+    let (Some(pem_path), Some(cert_url)) = (&cfg.privkey_pem_path, &cfg.cert_url) else {
+        return Ok(None);
+    };
+    let privkey_pem = std::fs::read(pem_path)
+        .map_err(|e| anyhow::anyhow!("stir: cannot read privkey_pem_path={pem_path:?}: {e}"))?;
+    let attest = match cfg.attest.as_str() {
+        "B" => sipora_auth::stir::AttestLevel::Partial,
+        "C" => sipora_auth::stir::AttestLevel::Gateway,
+        _ => sipora_auth::stir::AttestLevel::Full,
+    };
+    tracing::info!(cert_url = %cert_url, attest = %cfg.attest, "B2BUA STIR/SHAKEN signing enabled");
+    Ok(Some(udp::B2buaStirConfig {
+        privkey_pem,
+        cert_url: cert_url.clone(),
+        attest,
+    }))
 }
 
 async fn run_cdr_codec_demo(config: &SiporaConfig) -> Result<()> {

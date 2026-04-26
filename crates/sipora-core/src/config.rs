@@ -19,6 +19,7 @@ pub struct SiporaConfig {
     pub media: MediaConfig,
     pub kafka: KafkaConfig,
     pub b2bua: B2buaConfig,
+    pub stir: StirConfig,
 }
 
 /// B2BUA: back-to-back SIP signaling toward a downstream peer (B-leg).
@@ -320,6 +321,42 @@ impl Default for MediaConfig {
     }
 }
 
+/// STIR/SHAKEN policy for SIP INVITE Identity header verification (proxy) and PASSporT signing (B2BUA).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StirConfig {
+    /// Verification mode for inbound Identity headers: "disabled" (default), "permissive", or "strict".
+    #[serde(default = "default_stir_mode")]
+    pub mode: String,
+    /// Source IPs whose P-Asserted-Identity headers are trusted (RFC 3325 §9.1).
+    /// Accepts IPv4 and IPv6 literals; CIDR notation is not supported.
+    #[serde(default)]
+    pub trusted_peer_ips: Vec<String>,
+    /// Path to an EC (P-256) private key PEM for B2BUA outbound PASSporT signing.
+    /// When absent, the B2BUA does not attach an Identity header.
+    #[serde(default)]
+    pub privkey_pem_path: Option<String>,
+    /// Publicly-reachable HTTPS URL where the STI-AS signing certificate can be fetched.
+    /// Required when `privkey_pem_path` is set.
+    #[serde(default)]
+    pub cert_url: Option<String>,
+    /// Attestation level the B2BUA can vouch for: "A" (full), "B" (partial), "C" (gateway).
+    #[serde(default = "default_attest_level")]
+    pub attest: String,
+}
+
+impl Default for StirConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_stir_mode(),
+            trusted_peer_ips: Vec::new(),
+            privkey_pem_path: None,
+            cert_url: None,
+            attest: default_attest_level(),
+        }
+    }
+}
+
 /// Optional Kafka brokers for CDR export. Empty `brokers` disables publishing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -462,6 +499,12 @@ fn default_rtp_timeout_s() -> u64 {
 }
 fn default_kafka_cdr_topic() -> String {
     "sip.cdrs".into()
+}
+fn default_stir_mode() -> String {
+    "disabled".into()
+}
+fn default_attest_level() -> String {
+    "A".into()
 }
 
 impl SiporaConfig {
