@@ -1,8 +1,9 @@
 use crate::codec::CodecPolicy;
 use crate::routing::ProxyRouter;
+use sipora_auth::stir::{AttestLevel, identity_header_value, sign_passport};
 use sipora_sip::parser::message::parse_sip_message;
 use sipora_sip::serialize::serialize_message;
-use sipora_sip::types::header::{Header, Transport, Via};
+use sipora_sip::types::header::{Header, NameAddr, Transport, Via};
 use sipora_sip::types::message::{Request, SipMessage};
 use sipora_sip::types::method::Method;
 use sipora_transport::udp::UdpTransport;
@@ -13,6 +14,16 @@ use tokio::sync::Mutex;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+/// STIR/SHAKEN signing credentials for outbound PASSporTs (RFC 8224).
+pub struct B2buaStirConfig {
+    /// EC private key PEM (`BEGIN EC PRIVATE KEY` or `BEGIN PRIVATE KEY`).
+    pub privkey_pem: Vec<u8>,
+    /// Publicly reachable URL for the STI-AS signing certificate.
+    pub cert_url: String,
+    /// Attestation level the B2BUA can vouch for (A/B/C per RFC 8588).
+    pub attest: AttestLevel,
+}
+
 /// B2BUA UDP relay: downstream address, codec policy, and router (owned per task).
 pub struct B2buaUdpRuntime {
     pub downstream: SocketAddr,
@@ -20,6 +31,8 @@ pub struct B2buaUdpRuntime {
     pub sip_port: u16,
     pub policy: CodecPolicy,
     pub router: ProxyRouter,
+    /// If set, sign every outbound INVITE with a STIR PASSporT.
+    pub stir: Option<B2buaStirConfig>,
 }
 
 pub async fn resolve_downstream(spec: &str) -> Option<SocketAddr> {
@@ -128,6 +141,12 @@ async fn forward_invite(
         set_body(&mut req, new_sdp.into_bytes());
     }
 
+    // RFC 8224: sign a PASSporT for the outbound INVITE when STI-AS credentials
+    // are configured. Signing failure is non-fatal — the call still proceeds.
+    if let Some(stir) = &rt.stir {
+        attach_passport(&mut req, stir);
+    }
+
     let branch = format!("z9hG4bK{}", Uuid::new_v4().as_simple());
     let via = Header::Via(Via {
         transport: Transport::Udp,
@@ -146,6 +165,59 @@ async fn forward_invite(
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, rt.downstream).await?;
     Ok(())
+}
+
+/// Extract a telephone number or SIP user-part from a URI for use as a PASSporT TN.
+fn tn_from_uri(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("tel:") {
+        return rest.split(';').next().unwrap_or(rest).to_owned();
+    }
+    let after_scheme = uri
+        .strip_prefix("sips:")
+        .or_else(|| uri.strip_prefix("sip:"))
+        .unwrap_or(uri);
+    after_scheme
+        .split('@')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_owned()
+}
+
+/// Sign a PASSporT and attach an Identity header to the outbound INVITE.
+fn attach_passport(req: &mut Request, stir: &B2buaStirConfig) {
+    let orig_tn = req
+        .headers
+        .iter()
+        .find_map(|h| {
+            if let Header::From(NameAddr { uri, .. }) = h {
+                Some(tn_from_uri(uri))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    let dest_tn = tn_from_uri(&req.uri);
+    let origid = Uuid::new_v4().to_string();
+
+    match sign_passport(
+        &orig_tn,
+        &[dest_tn.as_str()],
+        stir.attest,
+        &origid,
+        &stir.privkey_pem,
+        &stir.cert_url,
+    ) {
+        Ok(token) => {
+            // Remove any pre-existing Identity header before attaching ours.
+            req.headers.retain(|h| !matches!(h, Header::Identity(_)));
+            req.headers.push(Header::Identity(identity_header_value(
+                &token,
+                &stir.cert_url,
+            )));
+            tracing::debug!(%orig_tn, %dest_tn, "STIR PASSporT attached");
+        }
+        Err(e) => tracing::warn!(%e, "STIR signing failed; forwarding without Identity"),
+    }
 }
 
 fn set_body(req: &mut Request, body: Vec<u8>) {

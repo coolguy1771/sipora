@@ -15,6 +15,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+sipora-auth = { workspace = true }
 sipora-core = { workspace = true }
 sipora-sdp = { workspace = true }
 sipora-sip = { workspace = true }

@@ -81,8 +81,26 @@ fn match_header(name: &str, value: &[u8]) -> Header {
             .map(Header::MinSE)
             .unwrap_or_else(|| ext(name, value)),
         "identity" => Header::Identity(trim_str(value)),
-        "p-asserted-identity" => Header::PAssertedIdentity(trim_str(value)),
-        "p-preferred-identity" => Header::PPreferredIdentity(trim_str(value)),
+        "p-asserted-identity" => {
+            let raw = trim_str(value);
+            match parse_name_addr(value) {
+                Ok((_, na)) if !na.uri.trim().is_empty() => Header::PAssertedIdentity(na),
+                _ => Header::Extension {
+                    name: "P-Asserted-Identity".to_owned(),
+                    value: raw,
+                },
+            }
+        }
+        "p-preferred-identity" => {
+            let raw = trim_str(value);
+            match parse_name_addr(value) {
+                Ok((_, na)) if !na.uri.trim().is_empty() => Header::PPreferredIdentity(na),
+                _ => Header::Extension {
+                    name: "P-Preferred-Identity".to_owned(),
+                    value: raw,
+                },
+            }
+        }
         _ => ext(name, value),
     }
 }

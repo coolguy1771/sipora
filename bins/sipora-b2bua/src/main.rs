@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         sip_port,
         policy: codec::CodecPolicy::new(config.media.allowed_codecs.clone()),
         router: routing::ProxyRouter::new(config.proxy.max_forwards),
+        stir: None, // disabled by default; set via config when STI-AS credentials are available
     };
 
     let ready = AtomicReady::new();

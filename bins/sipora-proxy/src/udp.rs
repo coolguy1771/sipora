@@ -2,11 +2,15 @@
 //! see `AGENTS.md` ("SIP signaling scope") and `docs/qualification.md` for end-to-end INVITE paths.
 
 use fred::prelude::{Expiration, KeysInterface, LuaInterface, SetOptions};
-use sipora_auth::digest::{DigestChallenge, DigestResponse, validate_nc, verify_digest};
+use sipora_auth::digest::{
+    DigestChallenge, DigestResponse, EffectiveHa1Error, effective_stored_ha1_for_digest,
+    validate_nc, verify_digest,
+};
+use sipora_auth::stir::{CertCache, StirError, verify_identity_header};
 use sipora_core::redis::RedisPool;
 use sipora_core::redis_keys::{
-    LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH, register_commit_lock_key,
-    register_digest_nonce_key, register_digest_nonce_nc_key, register_transaction_ok_key,
+    LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH, register_commit_lock_key, register_digest_nonce_key,
+    register_digest_nonce_nc_key, register_transaction_ok_key,
 };
 use sipora_data::pg::get_user_sip_digest_ha1;
 use sipora_location::ContactBinding;
@@ -46,6 +50,37 @@ pub struct RegistrarLimits {
     pub default_expires: u32,
 }
 
+/// How the proxy handles inbound STIR Identity headers (RFC 8224).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum StirMode {
+    /// Do not inspect Identity headers (default for legacy deployments).
+    Disabled,
+    /// Verify Identity if present; log failures but never reject.
+    #[allow(dead_code)]
+    Permissive,
+    /// Require Identity on every INVITE; reject if absent or invalid.
+    Strict,
+}
+
+/// STIR/SHAKEN verification policy for inbound INVITEs.
+pub struct StirConfig {
+    pub mode: StirMode,
+    /// Source IPs whose P-Asserted-Identity headers are trusted (RFC 3325 §9.1).
+    pub trusted_peer_ips: Vec<IpAddr>,
+    pub cert_cache: CertCache,
+}
+
+impl Default for StirConfig {
+    fn default() -> Self {
+        Self {
+            mode: StirMode::Disabled,
+            trusted_peer_ips: vec![],
+            cert_cache: CertCache::new(),
+        }
+    }
+}
+
 /// Static UDP proxy configuration (per process).
 pub struct UdpProxyConfig {
     pub domain: String,
@@ -55,6 +90,7 @@ pub struct UdpProxyConfig {
     pub registrar: RegistrarLimits,
     pub nonce_ttl_s: u64,
     pub pg: PgPool,
+    pub stir: StirConfig,
 }
 
 pub type TransactionTable = Arc<RwLock<TransactionManager>>;
@@ -421,12 +457,7 @@ async fn handle_dialog_request(
     );
     let target_uri = dialog_target_uri(&mut req, &state, cfg);
     let Some(target) = resolve_udp_target(&target_uri).await else {
-        respond(
-            socket,
-            peer,
-            &overload_response(&req, 30),
-        )
-        .await;
+        respond(socket, peer, &overload_response(&req, 30)).await;
         return Ok(());
     };
     let method = req.method.clone();
@@ -532,6 +563,17 @@ async fn handle_invite(
 ) -> anyhow::Result<()> {
     // RFC 3261 §17.2.1: send 100 Trying immediately on INVITE receipt
     respond(socket, peer, &sip_response(&req, StatusCode::TRYING)).await;
+
+    let mut req = req;
+    // RFC 3325 §9.1: strip P-AI/P-PI from untrusted ingress before routing.
+    let trusted = is_trusted_peer(peer, &cfg.stir);
+    strip_untrusted_identity_headers(&mut req, trusted);
+    // RFC 8224: verify or require STIR Identity header per configured policy.
+    if let Some(reject_code) = check_stir_identity(&mut req, &cfg.stir).await {
+        respond(socket, peer, &sip_response(&req, reject_code)).await;
+        return Ok(());
+    }
+
     // RFC 4028 §8: reject if Session-Expires is below proxy minimum
     if check_session_expires(&req).is_some() {
         respond(socket, peer, &sip_response_with_min_se(&req, PROXY_MIN_SE)).await;
@@ -1127,16 +1169,32 @@ async fn register_send_digest_challenge_stale(
 ) -> anyhow::Result<()> {
     let nonce_sha256 = Uuid::new_v4().simple().to_string();
     let nonce_md5 = Uuid::new_v4().simple().to_string();
+    let mut stored_nonces: Vec<String> = Vec::new();
     for nonce in [&nonce_sha256, &nonce_md5] {
         if let Err(e) = store_register_nonce(redis, nonce, cfg.nonce_ttl_s).await {
+            for prev in &stored_nonces {
+                if let Err(ce) = invalidate_register_nonce(redis, prev).await {
+                    tracing::warn!(%ce, nonce = %prev, "register nonce rollback after store failure");
+                }
+            }
             tracing::warn!(%e, "register nonce store");
-            respond(socket, peer, &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR)).await;
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
             return Ok(());
         }
+        stored_nonces.push((*nonce).to_owned());
     }
     let challenges = [
-        DigestChallenge::new_sha256(realm, &nonce_sha256).with_stale(stale).to_www_authenticate(),
-        DigestChallenge::new_md5(realm, &nonce_md5).with_stale(stale).to_www_authenticate(),
+        DigestChallenge::new_sha256(realm, &nonce_sha256)
+            .with_stale(stale)
+            .to_www_authenticate(),
+        DigestChallenge::new_md5(realm, &nonce_md5)
+            .with_stale(stale)
+            .to_www_authenticate(),
     ];
     respond(socket, peer, &sip_response_multi_www_auth(req, &challenges)).await;
     Ok(())
@@ -1209,12 +1267,7 @@ async fn register_try_acquire_commit_lock(
         Ok(false) => {}
         Err(e) => {
             tracing::warn!(%e, "register redis (tx ok exists)");
-            respond(
-                socket,
-                peer,
-                &overload_response(req, 30),
-            )
-            .await;
+            respond(socket, peer, &overload_response(req, 30)).await;
             return Ok(None);
         }
     }
@@ -1229,33 +1282,18 @@ async fn register_try_acquire_commit_lock(
                 }
                 Ok(false) => {
                     tracing::warn!("register redis (tx ok false after lock miss; commit pending)");
-                    respond(
-                        socket,
-                        peer,
-                        &overload_response(req, 30),
-                    )
-                    .await;
+                    respond(socket, peer, &overload_response(req, 30)).await;
                 }
                 Err(e) => {
                     tracing::warn!(%e, "register redis (tx ok after lock miss)");
-                    respond(
-                        socket,
-                        peer,
-                        &overload_response(req, 30),
-                    )
-                    .await;
+                    respond(socket, peer, &overload_response(req, 30)).await;
                 }
             }
             return Ok(None);
         }
         Err(e) => {
             tracing::warn!(%e, "register redis (commit lock)");
-            respond(
-                socket,
-                peer,
-                &overload_response(req, 30),
-            )
-            .await;
+            respond(socket, peer, &overload_response(req, 30)).await;
             return Ok(None);
         }
     };
@@ -1336,7 +1374,25 @@ async fn register_commit_digest(
         respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
         return Ok(());
     };
-    if !verify_digest(dr, &ha1, "REGISTER") {
+    let ha1_verify = match effective_stored_ha1_for_digest(dr, &ha1) {
+        Ok(h) => h,
+        Err(EffectiveHa1Error::MissingCnonce) => {
+            tracing::warn!(username = %dr.username, "REGISTER digest -sess without cnonce");
+            respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(%e, username = %dr.username, "REGISTER digest HA1 derive");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if !verify_digest(dr, &ha1_verify, "REGISTER") {
         if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
             tracing::warn!(%e, "register invalidate nonce");
         }
@@ -1348,7 +1404,24 @@ async fn register_commit_digest(
     if let Some(nc_new) = dr.nc_as_u64() {
         let nc_key = register_digest_nonce_nc_key(&dr.nonce);
         let nc_prev: u64 = match redis.get::<Option<String>, _>(&nc_key).await {
-            Ok(Some(s)) => s.parse().unwrap_or(0),
+            Ok(Some(s)) => match s.parse::<u64>() {
+                Ok(v) => v,
+                Err(pe) => {
+                    tracing::warn!(
+                        %pe,
+                        %nc_key,
+                        nc_raw = %s,
+                        "register redis nc value is not a decimal u64"
+                    );
+                    respond(
+                        socket,
+                        peer,
+                        &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            },
             Ok(None) => 0,
             Err(e) => {
                 tracing::warn!(%e, "register redis (nc get)");
@@ -1364,9 +1437,33 @@ async fn register_commit_digest(
             respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
             return Ok(());
         }
-        let _: Result<Option<String>, _> = redis
-            .set(&nc_key, nc_new.to_string(), Some(Expiration::EX(cfg.nonce_ttl_s.max(1) as i64)), None, false)
+        let nc_set: Result<Option<String>, _> = redis
+            .set(
+                &nc_key,
+                nc_new.to_string(),
+                Some(Expiration::EX(cfg.nonce_ttl_s.max(1) as i64)),
+                None,
+                false,
+            )
             .await;
+        match nc_set {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    %nc_key,
+                    nc_new,
+                    "register redis (nc set); aborting REGISTER to avoid nc replay window"
+                );
+                respond(
+                    socket,
+                    peer,
+                    &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+                )
+                .await;
+                return Ok(());
+            }
+        }
     }
 
     if let Err(e) = upsert_contact(redis, dom, user, binding, expires as i64).await {
@@ -1391,6 +1488,83 @@ async fn register_commit_digest(
 
 async fn respond(socket: &tokio::net::UdpSocket, peer: SocketAddr, msg: &SipMessage) {
     let _ = socket.send_to(&serialize_message(msg), peer).await;
+}
+
+// ── STIR/SHAKEN helpers (RFC 8224) ──────────────────────────────────────────
+
+fn is_trusted_peer(peer: SocketAddr, cfg: &StirConfig) -> bool {
+    cfg.trusted_peer_ips.contains(&peer.ip())
+}
+
+/// RFC 3325 §9.1: strip P-Asserted-Identity and P-Preferred-Identity headers
+/// that arrived from untrusted network elements.
+fn strip_untrusted_identity_headers(req: &mut Request, trusted: bool) {
+    if !trusted {
+        req.headers.retain(|h| {
+            !matches!(
+                h,
+                Header::PAssertedIdentity(_) | Header::PPreferredIdentity(_)
+            )
+        });
+    }
+}
+
+/// Verify the STIR Identity header on an INVITE and apply the configured policy.
+///
+/// In `Permissive` mode: invalid Identity headers are stripped from `req` so
+/// the downstream UA does not receive unverifiable attestation claims; the call
+/// proceeds regardless.
+///
+/// In `Strict` mode: absent or invalid Identity causes rejection with the
+/// appropriate RFC 8224 §5 status code.
+///
+/// Returns `Some(status)` if the request must be rejected, `None` to continue.
+async fn check_stir_identity(req: &mut Request, cfg: &StirConfig) -> Option<StatusCode> {
+    if cfg.mode == StirMode::Disabled {
+        return None;
+    }
+
+    let identity = req.headers.iter().find_map(|h| match h {
+        Header::Identity(v) => Some(v.clone()),
+        _ => None,
+    });
+
+    let identity_val = match identity {
+        None => {
+            return if cfg.mode == StirMode::Strict {
+                Some(StatusCode::USE_IDENTITY_HEADER)
+            } else {
+                None
+            };
+        }
+        Some(v) => v,
+    };
+
+    match verify_identity_header(&identity_val, &cfg.cert_cache).await {
+        Ok(result) => {
+            tracing::debug!(
+                attest = ?result.attest,
+                orig_tn = %result.orig_tn,
+                cert_url = %result.cert_url,
+                "STIR PASSporT verified"
+            );
+            None
+        }
+        Err(e) => {
+            let code = match &e {
+                StirError::CertFetch(_) | StirError::CertParse(_) => StatusCode::BAD_IDENTITY_INFO,
+                _ => StatusCode::INVALID_IDENTITY_HEADER,
+            };
+            tracing::warn!(%e, "STIR verification failed");
+            if cfg.mode == StirMode::Strict {
+                Some(code)
+            } else {
+                // Permissive: strip the unverifiable Identity header before forwarding.
+                req.headers.retain(|h| !matches!(h, Header::Identity(_)));
+                None
+            }
+        }
+    }
 }
 
 fn sip_response(req: &Request, status: StatusCode) -> SipMessage {
@@ -1650,6 +1824,7 @@ mod tests {
             pg: PgPoolOptions::new()
                 .connect_lazy("postgres://localhost/sipora")
                 .unwrap(),
+            stir: StirConfig::default(),
         }
     }
 

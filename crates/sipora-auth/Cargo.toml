@@ -27,6 +27,8 @@ sipora-core = { workspace = true }
 reqwest = { workspace = true }
 moka = { workspace = true }
 x509-cert = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["pkcs8", "pem", "ecdsa"] }
+rcgen = "0.13"

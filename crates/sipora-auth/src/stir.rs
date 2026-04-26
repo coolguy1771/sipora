@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use url::Url;
 
 /// PASSporT is invalid if its iat is older than this (RFC 8224 §3).
 const PASSPORT_MAX_AGE_S: u64 = 60;
@@ -77,6 +78,10 @@ struct PassportClaims {
 ///
 /// Certs have long validity periods (typically years). We cache for 1 h to
 /// avoid repeatedly fetching the same STI-CA cert on every call.
+///
+/// Both `moka::future::Cache` and `reqwest::Client` are cheaply `Clone`
+/// (reference-counted internally), so `CertCache` can be freely shared.
+#[derive(Clone)]
 pub struct CertCache {
     inner: Cache<String, String>,
     http: Client,
@@ -97,6 +102,13 @@ impl CertCache {
     }
 
     async fn fetch_cert_pem(&self, url: &str) -> Result<String, StirError> {
+        let parsed = Url::parse(url).map_err(|e| StirError::CertFetch(e.to_string()))?;
+        if parsed.scheme() != "https" {
+            return Err(StirError::CertFetch(format!(
+                "certificate URL must use https (got scheme {:?})",
+                parsed.scheme()
+            )));
+        }
         if let Some(cached) = self.inner.get(url).await {
             return Ok(cached);
         }
@@ -109,8 +121,15 @@ impl CertCache {
             .text()
             .await
             .map_err(|e| StirError::CertFetch(e.to_string()))?;
+        let _spki = spki_pem_from_cert_pem(&pem)?;
         self.inner.insert(url.to_owned(), pem.clone()).await;
         Ok(pem)
+    }
+
+    /// Seed the in-memory cert cache (tests only); avoids outbound HTTP for `fetch_cert_pem`.
+    #[cfg(test)]
+    pub async fn insert_pem_for_test(&self, url: impl Into<String>, pem: String) {
+        self.inner.insert(url.into(), pem).await;
     }
 }
 
@@ -175,7 +194,9 @@ fn spki_pem_from_cert_pem(cert_pem: &str) -> Result<String, StirError> {
         .map_err(|e| StirError::CertParse(e.to_string()))?;
 
     let b64 = B64.encode(&spki_der);
-    Ok(format!("-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n"))
+    Ok(format!(
+        "-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n"
+    ))
 }
 
 fn now_secs() -> u64 {
@@ -246,8 +267,12 @@ pub fn sign_passport(
     let iat = now_secs();
     let claims = PassportClaims {
         iat,
-        orig: OrigTn { tn: orig_tn.to_owned() },
-        dest: DestTns { tn: dest_tn.iter().map(|s| (*s).to_owned()).collect() },
+        orig: OrigTn {
+            tn: orig_tn.to_owned(),
+        },
+        dest: DestTns {
+            tn: dest_tn.iter().map(|s| (*s).to_owned()).collect(),
+        },
         attest: match attest {
             AttestLevel::Full => "A".to_owned(),
             AttestLevel::Partial => "B".to_owned(),
@@ -263,8 +288,8 @@ pub fn sign_passport(
         ..Default::default()
     };
 
-    let key = EncodingKey::from_ec_pem(privkey_pem)
-        .map_err(|e| StirError::SignError(e.to_string()))?;
+    let key =
+        EncodingKey::from_ec_pem(privkey_pem).map_err(|e| StirError::SignError(e.to_string()))?;
 
     encode(&header, &claims, &key).map_err(|e| StirError::SignError(e.to_string()))
 }
@@ -333,7 +358,10 @@ mod tests {
     #[test]
     fn identity_header_value_format() {
         let v = identity_header_value("tok.en.sig", "https://example.com/cert.pem");
-        assert_eq!(v, "tok.en.sig;info=<https://example.com/cert.pem>;alg=ES256");
+        assert_eq!(
+            v,
+            "tok.en.sig;info=<https://example.com/cert.pem>;alg=ES256"
+        );
     }
 
     #[test]
@@ -391,14 +419,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stale_passport_iat_check() {
-        let (priv_pem, _) = test_ec_p256_pem_pair();
+    #[tokio::test]
+    async fn stale_passport_iat_check() {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("rcgen key");
+        let cert = CertificateParams::new(vec!["localhost".into()])
+            .expect("certificate params")
+            .self_signed(&key_pair)
+            .expect("self_signed cert");
+        let cert_pem = cert.pem();
+        let priv_pem = key_pair.serialize_pem();
 
         let claims = PassportClaims {
             iat: 1_000_000_000, // year 2001 — definitely stale
-            orig: OrigTn { tn: "15551234567".into() },
-            dest: DestTns { tn: vec!["15557654321".into()] },
+            orig: OrigTn {
+                tn: "15551234567".into(),
+            },
+            dest: DestTns {
+                tn: vec!["15557654321".into()],
+            },
             attest: "A".into(),
             origid: "stale-id".into(),
         };
@@ -407,12 +447,20 @@ mod tests {
             typ: Some("passport".into()),
             ..Default::default()
         };
-        let key = EncodingKey::from_ec_pem(&priv_pem).unwrap();
+        let key = EncodingKey::from_ec_pem(priv_pem.as_bytes()).unwrap();
         let token = encode(&header, &claims, &key).unwrap();
 
-        // The verify_identity_header freshness gate would reject this token.
         let age = now_secs().saturating_sub(claims.iat);
         assert!(age > PASSPORT_MAX_AGE_S);
-        let _ = token;
+
+        let cert_url = "https://example.invalid/sipora-stir-test-cert.pem";
+        let identity = identity_header_value(&token, cert_url);
+        let cache = CertCache::new();
+        cache.insert_pem_for_test(cert_url, cert_pem).await;
+
+        let err = verify_identity_header(&identity, &cache)
+            .await
+            .expect_err("stale iat must be rejected");
+        assert!(matches!(err, StirError::Stale));
     }
 }

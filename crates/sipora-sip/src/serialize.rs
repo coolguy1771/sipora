@@ -105,11 +105,11 @@ fn serialize_header_value(header: &Header, buf: &mut Vec<u8>) {
             }
         }
         Header::MinSE(n) => buf.extend_from_slice(n.to_string().as_bytes()),
-        Header::Identity(v)
-        | Header::PAssertedIdentity(v)
-        | Header::PPreferredIdentity(v)
-        | Header::Extension { value: v, .. } => {
+        Header::Identity(v) | Header::Extension { value: v, .. } => {
             buf.extend_from_slice(v.as_bytes());
+        }
+        Header::PAssertedIdentity(na) | Header::PPreferredIdentity(na) => {
+            serialize_name_addr(na, buf);
         }
     }
 }

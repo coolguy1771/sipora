@@ -10,8 +10,17 @@ use md5::Md5;
 #[allow(unused_imports)]
 use sha2::Digest as _;
 use sha2::Sha256;
+use thiserror::Error;
 
 /// Digest algorithm variants (RFC 7616 §3.3).
+///
+/// For `MD5` and `SHA-256`, the SIP HA1 string is `hex(H(username:realm:password))`.
+///
+/// For `MD5-sess` and `SHA-256-sess` (RFC 2617 / RFC 7616), HA1 is the session form:
+/// `hex(H(H(username:realm:password) : nonce : cnonce))` where the inner `H` is over the
+/// UTF-8 `username:realm:password` string and produces raw digest bytes; the outer `H`
+/// is over the concatenation of those inner digest bytes, ASCII `:`, `nonce`, `:`, and
+/// `cnonce` (all as bytes). The `cnonce` from the Authorization header is required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DigestAlgorithm {
     #[default]
@@ -31,6 +40,7 @@ impl DigestAlgorithm {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // SIP `algorithm=` tokens are not full `FromStr` inputs.
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_uppercase().as_str() {
             "MD5" | "" => Some(Self::Md5),
@@ -85,7 +95,10 @@ impl DigestChallenge {
     pub fn to_www_authenticate(&self) -> String {
         let mut s = format!(
             "Digest realm=\"{}\", nonce=\"{}\", qop=\"{}\", algorithm={}",
-            self.realm, self.nonce, self.qop, self.algorithm.as_str()
+            self.realm,
+            self.nonce,
+            self.qop,
+            self.algorithm.as_str()
         );
         if self.stale {
             s.push_str(", stale=TRUE");
@@ -144,7 +157,17 @@ impl DigestResponse {
             }
         }
 
-        Some(Self { username, realm, nonce, uri, response, nc, cnonce, qop, algorithm })
+        Some(Self {
+            username,
+            realm,
+            nonce,
+            uri,
+            response,
+            nc,
+            cnonce,
+            qop,
+            algorithm,
+        })
     }
 
     /// Parse the nc field as a u64 (nc is 8 hex digits per RFC 7616).
@@ -153,17 +176,123 @@ impl DigestResponse {
     }
 }
 
+/// Building the HA1 value used in digest verification failed (wrong algorithm inputs or DB hex).
+#[derive(Debug, Error)]
+pub enum EffectiveHa1Error {
+    #[error("digest algorithm with -sess requires cnonce")]
+    MissingCnonce,
+    #[error("stored HA1 is not valid hex: {0}")]
+    InvalidHex(#[from] hex::FromHexError),
+    #[error("stored HA1 decodes to {got} bytes, expected {expected} for this algorithm")]
+    WrongInnerLength { expected: usize, got: usize },
+}
+
+fn sess_a1_input_bytes(inner_digest: &[u8], nonce: &str, cnonce: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(inner_digest.len() + 1 + nonce.len() + 1 + cnonce.len());
+    buf.extend_from_slice(inner_digest);
+    buf.push(b':');
+    buf.extend_from_slice(nonce.as_bytes());
+    buf.push(b':');
+    buf.extend_from_slice(cnonce.as_bytes());
+    buf
+}
+
+fn decode_inner_digest_hex(
+    stored_hex: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>, EffectiveHa1Error> {
+    let v = hex::decode(stored_hex)?;
+    if v.len() != expected_len {
+        return Err(EffectiveHa1Error::WrongInnerLength {
+            expected: expected_len,
+            got: v.len(),
+        });
+    }
+    Ok(v)
+}
+
+/// Compute the HA1 hex string used in digest verification for the given algorithm.
+///
+/// Non-session algorithms return `hex(H(username:realm:password))`. Session variants
+/// return `hex(H(H(username:realm:password) : nonce : cnonce))` and require `cnonce`.
+pub fn ha1_for(
+    algorithm: DigestAlgorithm,
+    username: &str,
+    realm: &str,
+    password: &str,
+    nonce: &str,
+    cnonce: Option<&str>,
+) -> Result<String, EffectiveHa1Error> {
+    match algorithm {
+        DigestAlgorithm::Md5 => Ok(compute_ha1(username, realm, password)),
+        DigestAlgorithm::Sha256 => Ok(compute_ha1_sha256(username, realm, password)),
+        DigestAlgorithm::Md5Sess => {
+            let cn = cnonce.ok_or(EffectiveHa1Error::MissingCnonce)?;
+            let inner = Md5::digest(format!("{username}:{realm}:{password}").as_bytes());
+            let buf = sess_a1_input_bytes(&inner, nonce, cn);
+            Ok(hex::encode(Md5::digest(&buf)))
+        }
+        DigestAlgorithm::Sha256Sess => {
+            let cn = cnonce.ok_or(EffectiveHa1Error::MissingCnonce)?;
+            let inner = Sha256::digest(format!("{username}:{realm}:{password}").as_bytes());
+            let buf = sess_a1_input_bytes(&inner, nonce, cn);
+            Ok(hex::encode(Sha256::digest(&buf)))
+        }
+    }
+}
+
+/// Derive the HA1 string to pass to [`verify_digest`] from the HA1 stored for the subscriber.
+///
+/// The database stores the non-session inner digest: `hex(H(username:realm:password))`.
+/// For `MD5-sess` / `SHA-256-sess`, this expands to the session HA1 using `nonce` and `cnonce`
+/// from `resp`. For plain `MD5` / `SHA-256`, the stored value is returned unchanged.
+pub fn effective_stored_ha1_for_digest(
+    resp: &DigestResponse,
+    stored_inner_ha1_hex: &str,
+) -> Result<String, EffectiveHa1Error> {
+    match resp.algorithm {
+        DigestAlgorithm::Md5 | DigestAlgorithm::Sha256 => Ok(stored_inner_ha1_hex.to_owned()),
+        DigestAlgorithm::Md5Sess => {
+            let cn = resp
+                .cnonce
+                .as_deref()
+                .ok_or(EffectiveHa1Error::MissingCnonce)?;
+            let inner = decode_inner_digest_hex(stored_inner_ha1_hex, 16)?;
+            let buf = sess_a1_input_bytes(&inner, &resp.nonce, cn);
+            Ok(hex::encode(Md5::digest(&buf)))
+        }
+        DigestAlgorithm::Sha256Sess => {
+            let cn = resp
+                .cnonce
+                .as_deref()
+                .ok_or(EffectiveHa1Error::MissingCnonce)?;
+            let inner = decode_inner_digest_hex(stored_inner_ha1_hex, 32)?;
+            let buf = sess_a1_input_bytes(&inner, &resp.nonce, cn);
+            Ok(hex::encode(Sha256::digest(&buf)))
+        }
+    }
+}
+
 // ── MD5 helpers ─────────────────────────────────────────────────────────────
 
 pub fn compute_ha1(username: &str, realm: &str, password: &str) -> String {
-    hex::encode(Md5::digest(format!("{username}:{realm}:{password}").as_bytes()))
+    hex::encode(Md5::digest(
+        format!("{username}:{realm}:{password}").as_bytes(),
+    ))
 }
 
 pub fn compute_ha2(method: &str, uri: &str) -> String {
     hex::encode(Md5::digest(format!("{method}:{uri}").as_bytes()))
 }
 
-pub fn compute_response(ha1: &str, nonce: &str, nc: &str, cnonce: &str, qop: &str, ha2: &str) -> String {
+pub fn compute_response(
+    ha1: &str,
+    nonce: &str,
+    nc: &str,
+    cnonce: &str,
+    qop: &str,
+    ha2: &str,
+) -> String {
     hex::encode(Md5::digest(
         format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}").as_bytes(),
     ))
@@ -176,14 +305,23 @@ pub fn compute_response_no_qop(ha1: &str, nonce: &str, ha2: &str) -> String {
 // ── SHA-256 helpers (RFC 7616 §3.4) ─────────────────────────────────────────
 
 pub fn compute_ha1_sha256(username: &str, realm: &str, password: &str) -> String {
-    hex::encode(Sha256::digest(format!("{username}:{realm}:{password}").as_bytes()))
+    hex::encode(Sha256::digest(
+        format!("{username}:{realm}:{password}").as_bytes(),
+    ))
 }
 
 pub fn compute_ha2_sha256(method: &str, uri: &str) -> String {
     hex::encode(Sha256::digest(format!("{method}:{uri}").as_bytes()))
 }
 
-pub fn compute_response_sha256(ha1: &str, nonce: &str, nc: &str, cnonce: &str, qop: &str, ha2: &str) -> String {
+pub fn compute_response_sha256(
+    ha1: &str,
+    nonce: &str,
+    nc: &str,
+    cnonce: &str,
+    qop: &str,
+    ha2: &str,
+) -> String {
     hex::encode(Sha256::digest(
         format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}").as_bytes(),
     ))
@@ -195,9 +333,13 @@ pub fn compute_response_no_qop_sha256(ha1: &str, nonce: &str, ha2: &str) -> Stri
 
 // ── Verification ─────────────────────────────────────────────────────────────
 
-/// Verify a digest response. `ha1` must match the algorithm used:
-/// - MD5/MD5-sess: `hex(MD5(username:realm:password))`
-/// - SHA-256/SHA-256-sess: `hex(SHA256(username:realm:password))`
+/// Verify a digest response.
+///
+/// `ha1` must be the digest A1 value appropriate for `resp.algorithm` in hex (lowercase
+/// or uppercase accepted in the client `response` only; `ha1` is compared via the KD path):
+/// - `MD5` / `SHA-256`: the stored inner `hex(H(username:realm:password))`.
+/// - `MD5-sess` / `SHA-256-sess`: the session HA1 from RFC 2617 / RFC 7616 — use
+///   [`effective_stored_ha1_for_digest`] when starting from the stored inner HA1.
 pub fn verify_digest(resp: &DigestResponse, ha1: &str, method: &str) -> bool {
     match resp.algorithm {
         DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess => verify_digest_md5(resp, ha1, method),
@@ -275,7 +417,9 @@ pub fn verify_argon2_password(hash: &str, password: &str) -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
-    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
@@ -372,8 +516,7 @@ mod tests {
 
         let ha1 = compute_ha1_sha256(username, realm, password);
         let ha2 = compute_ha2_sha256(method, uri);
-        let expected_response =
-            compute_response_sha256(&ha1, nonce, nc, cnonce, qop, &ha2);
+        let expected_response = compute_response_sha256(&ha1, nonce, nc, cnonce, qop, &ha2);
 
         // Verify round-trip: parse a header built from our computed response
         let hdr = format!(
@@ -381,7 +524,10 @@ mod tests {
         );
         let dr = DigestResponse::parse(&hdr).unwrap();
         assert_eq!(dr.algorithm, DigestAlgorithm::Sha256);
-        assert!(verify_digest(&dr, &ha1, method), "RFC 7616 B.2 SHA-256 round-trip must pass");
+        assert!(
+            verify_digest(&dr, &ha1, method),
+            "RFC 7616 B.2 SHA-256 round-trip must pass"
+        );
     }
 
     // ── nc enforcement ────────────────────────────────────────────────────────
@@ -395,7 +541,10 @@ mod tests {
     fn nc_validation_rejects_replay() {
         assert_eq!(
             validate_nc(1, 1),
-            Err(NcError::Replay { nc_new: 1, nc_prev: 1 })
+            Err(NcError::Replay {
+                nc_new: 1,
+                nc_prev: 1
+            })
         );
     }
 
@@ -403,7 +552,10 @@ mod tests {
     fn nc_validation_rejects_large_gap() {
         assert_eq!(
             validate_nc(1002, 0),
-            Err(NcError::GapTooLarge { nc_new: 1002, nc_prev: 0 })
+            Err(NcError::GapTooLarge {
+                nc_new: 1002,
+                nc_prev: 0
+            })
         );
     }
 
@@ -424,5 +576,67 @@ mod tests {
         let hdr = r#"Digest username="alice", realm="example.com", nonce="n1", uri="sip:example.com", response="aabbcc", algorithm=SHA-256"#;
         let dr = DigestResponse::parse(hdr).unwrap();
         assert_eq!(dr.algorithm, DigestAlgorithm::Sha256);
+    }
+
+    #[test]
+    fn md5_sess_ha1_for_matches_effective_from_stored_inner() {
+        let u = "alice";
+        let r = "sip.example.com";
+        let p = "change-me";
+        let nonce = "server-nonce";
+        let cnonce = "client-nonce";
+        let inner = compute_ha1(u, r, p);
+        let hdr = format!(
+            r#"Digest username="{u}", realm="{r}", nonce="{nonce}", uri="sip:{r}", algorithm=MD5-sess, response="x", nc=00000001, cnonce="{cnonce}", qop=auth"#
+        );
+        let dr = DigestResponse::parse(&hdr).unwrap();
+        let via_password = ha1_for(DigestAlgorithm::Md5Sess, u, r, p, nonce, Some(cnonce)).unwrap();
+        let via_stored = effective_stored_ha1_for_digest(&dr, &inner).unwrap();
+        assert_eq!(via_password, via_stored);
+    }
+
+    #[test]
+    fn md5_sess_full_verify_roundtrip() {
+        let u = "bob";
+        let r = "example.net";
+        let p = "pwd";
+        let nonce = "n";
+        let cnonce = "c";
+        let nc = "00000001";
+        let qop = "auth";
+        let uri = "sip:example.net";
+        let inner = compute_ha1(u, r, p);
+        let eff = ha1_for(DigestAlgorithm::Md5Sess, u, r, p, nonce, Some(cnonce)).unwrap();
+        let ha2 = compute_ha2("REGISTER", uri);
+        let response = compute_response(&eff, nonce, nc, cnonce, qop, &ha2);
+        let hdr = format!(
+            r#"Digest username="{u}", realm="{r}", nonce="{nonce}", uri="{uri}", algorithm=MD5-sess, response="{response}", nc={nc}, cnonce="{cnonce}", qop={qop}"#
+        );
+        let dr = DigestResponse::parse(&hdr).unwrap();
+        let eff2 = effective_stored_ha1_for_digest(&dr, &inner).unwrap();
+        assert!(verify_digest(&dr, &eff2, "REGISTER"));
+    }
+
+    #[test]
+    fn sha256_sess_full_verify_roundtrip() {
+        let u = "carol";
+        let r = "ex.example";
+        let p = "pw";
+        let nonce = "n2";
+        let cnonce = "c2";
+        let nc = "00000001";
+        let qop = "auth";
+        let uri = "sip:carol@ex.example";
+        let inner = compute_ha1_sha256(u, r, p);
+        let eff = ha1_for(DigestAlgorithm::Sha256Sess, u, r, p, nonce, Some(cnonce)).unwrap();
+        let ha2 = compute_ha2_sha256("REGISTER", uri);
+        let response = compute_response_sha256(&eff, nonce, nc, cnonce, qop, &ha2);
+        let hdr = format!(
+            r#"Digest username="{u}", realm="{r}", nonce="{nonce}", uri="{uri}", algorithm=SHA-256-SESS, response="{response}", nc={nc}, cnonce="{cnonce}", qop={qop}"#
+        );
+        let dr = DigestResponse::parse(&hdr).unwrap();
+        assert_eq!(dr.algorithm, DigestAlgorithm::Sha256Sess);
+        let eff2 = effective_stored_ha1_for_digest(&dr, &inner).unwrap();
+        assert!(verify_digest(&dr, &eff2, "REGISTER"));
     }
 }

@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
         },
         nonce_ttl_s: nonce_ttl,
         pg,
+        stir: udp::StirConfig::default(),
     };
     let forward_table = forward_table::new_forward_table();
     let dialog_table = dialog::new_dialog_table();

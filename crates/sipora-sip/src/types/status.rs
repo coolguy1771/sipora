@@ -19,6 +19,14 @@ impl StatusCode {
     pub const REQUEST_TIMEOUT: Self = Self(408);
     pub const SESSION_INTERVAL_TOO_SMALL: Self = Self(422);
     pub const INTERVAL_TOO_BRIEF: Self = Self(423);
+    /// RFC 8224 §5 — Identity header absent when required.
+    pub const USE_IDENTITY_HEADER: Self = Self(428);
+    /// RFC 8224 §5 — info= URL unreachable or cert invalid.
+    pub const BAD_IDENTITY_INFO: Self = Self(436);
+    /// RFC 8224 §5 — credential algorithm or attestation level not acceptable.
+    pub const UNSUPPORTED_CREDENTIAL: Self = Self(437);
+    /// RFC 8224 §5 — PASSporT signature verification failed.
+    pub const INVALID_IDENTITY_HEADER: Self = Self(438);
     pub const TEMPORARILY_UNAVAILABLE: Self = Self(480);
     pub const CALL_DOES_NOT_EXIST: Self = Self(481);
     pub const TOO_MANY_HOPS: Self = Self(483);
@@ -46,6 +54,10 @@ impl StatusCode {
             408 => "Request Timeout",
             422 => "Session Interval Too Small",
             423 => "Interval Too Brief",
+            428 => "Use Identity Header",
+            436 => "Bad Identity Info",
+            437 => "Unsupported Credential",
+            438 => "Invalid Identity Header",
             480 => "Temporarily Unavailable",
             481 => "Call/Transaction Does Not Exist",
             483 => "Too Many Hops",

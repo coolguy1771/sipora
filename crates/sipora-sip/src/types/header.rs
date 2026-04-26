@@ -38,9 +38,9 @@ pub enum Header {
     /// RFC 8224 STIR call identity token.
     Identity(String),
     /// RFC 3325 asserted identity (trusted network → proxy).
-    PAssertedIdentity(String),
+    PAssertedIdentity(NameAddr),
     /// RFC 3325 preferred identity hint (UA → proxy).
-    PPreferredIdentity(String),
+    PPreferredIdentity(NameAddr),
     Extension {
         name: String,
         value: String,
