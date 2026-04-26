@@ -357,6 +357,42 @@ impl Default for StirConfig {
     }
 }
 
+impl StirConfig {
+    /// Ensures `[stir]` values are recognized and signing keys have a public cert URL.
+    pub fn validate(&self) -> Result<(), config::ConfigError> {
+        let mode = self.mode.trim().to_ascii_lowercase();
+        if mode.is_empty() {
+            return Err(config::ConfigError::Message(
+                "[stir].mode must not be empty (allowed: disabled, permissive, strict)".into(),
+            ));
+        }
+        if !matches!(mode.as_str(), "disabled" | "permissive" | "strict") {
+            return Err(config::ConfigError::Message(format!(
+                "[stir].mode={:?} is invalid (allowed: disabled, permissive, strict)",
+                self.mode
+            )));
+        }
+        let attest = self.attest.trim().to_ascii_lowercase();
+        if attest.is_empty() {
+            return Err(config::ConfigError::Message(
+                "[stir].attest must not be empty (allowed: A, B, C)".into(),
+            ));
+        }
+        if !matches!(attest.as_str(), "a" | "b" | "c") {
+            return Err(config::ConfigError::Message(format!(
+                "[stir].attest={:?} is invalid (allowed: A, B, C)",
+                self.attest
+            )));
+        }
+        if self.privkey_pem_path.is_some() && self.cert_url.is_none() {
+            return Err(config::ConfigError::Message(
+                "[stir].cert_url is required when [stir].privkey_pem_path is set".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Optional Kafka brokers for CDR export. Empty `brokers` disables publishing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -520,6 +556,9 @@ impl SiporaConfig {
     /// - **Path** (existing file, or contains `/`, `\\`, or ends in `.toml`/`.yaml`/`.yml`): load that path.
     ///
     /// Environment `SIPORA__*` still merges on top. Empty input is treated as `sipora`.
+    ///
+    /// After deserialize, [`StirConfig::validate`](StirConfig::validate) runs so invalid
+    /// `[stir]` values fail fast (raw `try_deserialize` skips this).
     pub fn load_from_config_input(config_input: &str) -> Result<Self, config::ConfigError> {
         let input = config_input.trim();
         let input = if input.is_empty() { "sipora" } else { input };
@@ -533,7 +572,9 @@ impl SiporaConfig {
         };
         let builder =
             builder.add_source(config::Environment::with_prefix("SIPORA").separator("__"));
-        builder.build()?.try_deserialize()
+        let cfg: SiporaConfig = builder.build()?.try_deserialize()?;
+        cfg.stir.validate()?;
+        Ok(cfg)
     }
 }
 

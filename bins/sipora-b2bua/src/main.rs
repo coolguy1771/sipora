@@ -96,9 +96,10 @@ fn build_b2bua_stir(cfg: &sipora_core::config::StirConfig) -> Result<Option<udp:
     };
     let privkey_pem = std::fs::read(pem_path)
         .map_err(|e| anyhow::anyhow!("stir: cannot read privkey_pem_path={pem_path:?}: {e}"))?;
-    let attest = match cfg.attest.as_str() {
-        "B" => sipora_auth::stir::AttestLevel::Partial,
-        "C" => sipora_auth::stir::AttestLevel::Gateway,
+    let attest_lc = cfg.attest.trim().to_ascii_lowercase();
+    let attest = match attest_lc.as_str() {
+        "b" => sipora_auth::stir::AttestLevel::Partial,
+        "c" => sipora_auth::stir::AttestLevel::Gateway,
         _ => sipora_auth::stir::AttestLevel::Full,
     };
     tracing::info!(cert_url = %cert_url, attest = %cfg.attest, "B2BUA STIR/SHAKEN signing enabled");

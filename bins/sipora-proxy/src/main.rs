@@ -111,7 +111,8 @@ async fn main() -> Result<()> {
 
 fn build_stir_config(cfg: &sipora_core::config::StirConfig) -> udp::StirConfig {
     use std::net::IpAddr;
-    let mode = match cfg.mode.as_str() {
+    let mode_lc = cfg.mode.trim().to_ascii_lowercase();
+    let mode = match mode_lc.as_str() {
         "permissive" => udp::StirMode::Permissive,
         "strict" => udp::StirMode::Strict,
         _ => udp::StirMode::Disabled,
