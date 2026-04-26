@@ -956,15 +956,9 @@ async fn handle_prack(
         .await;
         return Ok(());
     };
-    if let Some(i) = req
-        .headers
-        .iter()
-        .position(|h| matches!(h, Header::Via(_)))
-        && matches!(
-            &req.headers[i],
-            Header::Via(v) if via_matches_proxy(v, &cfg.advertise, cfg.sip_port)
-        )
-    {
+    if let Some(i) = req.headers.iter().position(
+        |h| matches!(h, Header::Via(v) if via_matches_proxy(v, &cfg.advertise, cfg.sip_port)),
+    ) {
         req.headers.remove(i);
     }
     prepend_proxy_via(&mut req, &cfg.advertise, cfg.sip_port);

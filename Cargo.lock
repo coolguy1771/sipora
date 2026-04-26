@@ -3278,6 +3278,7 @@ dependencies = [
  "clap",
  "sipora-core",
  "sipora-data",
+ "sipora-sdp",
  "sipora-sip",
  "sipora-transport",
  "tokio",

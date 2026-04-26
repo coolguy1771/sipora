@@ -53,6 +53,7 @@ impl TlsClientPool {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = ServerName::try_from(server_name.to_owned())?;
         let key: PoolKey = (addr, server_name.to_owned());
+        let mut last_err: Option<std::io::Error> = None;
 
         for _ in 0..2u8 {
             let cell = {
@@ -71,21 +72,23 @@ impl TlsClientPool {
             let stream = inner
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("TLS stream missing after connect"))?;
-            let write_ok = stream.write_all(data).await.is_ok();
-            let flush_ok = if write_ok {
-                stream.flush().await.is_ok()
-            } else {
-                false
-            };
-            if write_ok && flush_ok {
-                return Ok(());
+
+            match stream.write_all(data).await {
+                Ok(()) => match stream.flush().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = Some(e),
+                },
+                Err(e) => last_err = Some(e),
             }
             *inner = None;
             drop(inner);
             self.pool.lock().await.remove(&key);
         }
 
-        Err(std::io::Error::other("TLS send failed after retry").into())
+        Err(match last_err {
+            Some(e) => std::io::Error::other(format!("TLS send failed after retry: {e}")).into(),
+            None => std::io::Error::other("TLS send failed after retry").into(),
+        })
     }
 
     /// Explicitly close and evict the connection for `addr` and `server_name`.

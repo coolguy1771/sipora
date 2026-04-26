@@ -1,4 +1,9 @@
-//! Codec allowlist and SDP filtering for negotiated media.
+// rtpengine contract:
+// - rtpengine rewrites: a=candidate, a=ice-ufrag, a=ice-pwd, a=fingerprint (if terminating DTLS)
+// - sipora-b2bua must preserve: o=, s=, t=, a=sendrecv/sendonly, a=fmtp, codec list order
+// - sipora-b2bua must NOT strip: a=rtcp, b=AS, b=RR, b=RS, telephone-event
+
+//! Codec allowlist, SDP filtering, and B2BUA offer/answer state for negotiated media.
 
 #[derive(Clone)]
 pub struct CodecPolicy {
@@ -35,6 +40,31 @@ impl CodecPolicy {
         }
 
         (filtered_lines.join("\r\n"), removed)
+    }
+}
+
+/// Two-leg offer/answer state for one B2BUA dialog.
+///
+/// `uac_leg` tracks the offer/answer state toward the user agent client (caller);
+/// `uas_leg` tracks the state toward the user agent server (callee / rtpengine).
+/// The two legs are independent — media is not simply forwarded between them.
+pub struct B2buaDialog {
+    pub uac_leg: sipora_sdp::offer_answer::OfferAnswerMachine,
+    pub uas_leg: sipora_sdp::offer_answer::OfferAnswerMachine,
+}
+
+impl B2buaDialog {
+    pub fn new() -> Self {
+        Self {
+            uac_leg: sipora_sdp::offer_answer::OfferAnswerMachine::new(),
+            uas_leg: sipora_sdp::offer_answer::OfferAnswerMachine::new(),
+        }
+    }
+}
+
+impl Default for B2buaDialog {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
