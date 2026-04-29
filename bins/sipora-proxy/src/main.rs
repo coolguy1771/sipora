@@ -111,11 +111,12 @@ async fn main() -> Result<()> {
 
 fn build_stir_config(cfg: &sipora_core::config::StirConfig) -> udp::StirConfig {
     use std::net::IpAddr;
-    let mode_lc = cfg.mode.trim().to_ascii_lowercase();
-    let mode = match mode_lc.as_str() {
+    // `mode` is normalized in `StirConfig::validate` (called from `SiporaConfig::load*`).
+    let mode = match cfg.mode.as_str() {
+        "disabled" => udp::StirMode::Disabled,
         "permissive" => udp::StirMode::Permissive,
         "strict" => udp::StirMode::Strict,
-        _ => udp::StirMode::Disabled,
+        _ => unreachable!("[stir].mode should be one of disabled|permissive|strict after validate"),
     };
     let trusted_peer_ips: Vec<IpAddr> = cfg
         .trusted_peer_ips

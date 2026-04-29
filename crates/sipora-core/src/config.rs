@@ -358,8 +358,10 @@ impl Default for StirConfig {
 }
 
 impl StirConfig {
-    /// Ensures `[stir]` values are recognized and signing keys have a public cert URL.
-    pub fn validate(&self) -> Result<(), config::ConfigError> {
+    /// Ensures `[stir]` values are recognized, signing keys have a public cert URL, and returns a
+    /// copy with `mode` and `attest` normalized (trimmed, ASCII lowercase) for callers to use
+    /// without re-parsing.
+    pub fn validate(&self) -> Result<StirConfig, config::ConfigError> {
         let mode = self.mode.trim().to_ascii_lowercase();
         if mode.is_empty() {
             return Err(config::ConfigError::Message(
@@ -389,7 +391,13 @@ impl StirConfig {
                 "[stir].cert_url is required when [stir].privkey_pem_path is set".into(),
             ));
         }
-        Ok(())
+        Ok(StirConfig {
+            mode,
+            trusted_peer_ips: self.trusted_peer_ips.clone(),
+            privkey_pem_path: self.privkey_pem_path.clone(),
+            cert_url: self.cert_url.clone(),
+            attest,
+        })
     }
 }
 
@@ -558,7 +566,9 @@ impl SiporaConfig {
     /// Environment `SIPORA__*` still merges on top. Empty input is treated as `sipora`.
     ///
     /// After deserialize, [`StirConfig::validate`](StirConfig::validate) runs so invalid
-    /// `[stir]` values fail fast (raw `try_deserialize` skips this).
+    /// `[stir]` values fail fast (raw `try_deserialize` skips this). The returned `stir` is
+    /// replaced with the normalized `StirConfig` from `validate` (trimmed, lowercased `mode` and
+    /// `attest`).
     pub fn load_from_config_input(config_input: &str) -> Result<Self, config::ConfigError> {
         let input = config_input.trim();
         let input = if input.is_empty() { "sipora" } else { input };
@@ -572,8 +582,8 @@ impl SiporaConfig {
         };
         let builder =
             builder.add_source(config::Environment::with_prefix("SIPORA").separator("__"));
-        let cfg: SiporaConfig = builder.build()?.try_deserialize()?;
-        cfg.stir.validate()?;
+        let mut cfg: SiporaConfig = builder.build()?.try_deserialize()?;
+        cfg.stir = cfg.stir.validate()?;
         Ok(cfg)
     }
 }

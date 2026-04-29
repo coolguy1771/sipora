@@ -1,5 +1,7 @@
 # Stability and versioning
 
+Authoritative **versioning and GA scope** for binaries and libraries.
+
 The workspace is **0.x** until an explicit **1.0.0** release. Semantic versioning applies to published artifacts (crates or container tags) once this project adopts them.
 
 ## Release tiers (target for 1.0.0)

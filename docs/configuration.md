@@ -1,6 +1,8 @@
 # Configuration
 
-All Sipora binaries deserialize the same structure, `SiporaConfig`, from `crates/sipora-core/src/config.rs`.
+Authoritative reference for the shared **`SiporaConfig`** shape loaded by every binary (implementation: `crates/sipora-core/src/config.rs`).
+
+All Sipora binaries deserialize the same structure, `SiporaConfig`, from that module.
 
 ## Sources and precedence
 
@@ -28,7 +30,7 @@ Each binary accepts:
 `sipora-api` also accepts:
 
 - `--port` / `SIPORA_API_PORT` (default `8080`): HTTP listen port. This is separate from `general.health_port` in `SiporaConfig`.
-- `--mock-store` / `SIPORA_API_MOCK_STORE` (default **true**): in-memory store so the API starts without Postgres; set `false` when the database is up and migrated.
+- `--mock-store` / `SIPORA_API_MOCK_STORE` (default **true**): in-memory store so the API starts without Postgres; set `SIPORA_API_MOCK_STORE=false` when the database is up and migrated (the CLI flag does not take a `false` argument).
 
 `sipora-migrate` also accepts:
 
