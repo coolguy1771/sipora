@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
             default_expires: def_exp,
         },
         nonce_ttl_s: nonce_ttl,
+        fork_parallel: config.proxy.fork_parallel,
         pg,
         stir: build_stir_config(&config.stir),
     };

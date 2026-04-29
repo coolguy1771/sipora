@@ -1,3 +1,4 @@
+use crate::call::B2buaCallStore;
 use crate::codec::CodecPolicy;
 use crate::routing::ProxyRouter;
 use sipora_auth::stir::{AttestLevel, identity_header_value, sign_passport};
@@ -7,12 +8,14 @@ use sipora_sip::types::header::{Header, NameAddr, Transport, Via};
 use sipora_sip::types::message::{Request, SipMessage};
 use sipora_sip::types::method::Method;
 use sipora_transport::udp::UdpTransport;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use uuid::Uuid;
+
+type SharedCallStore = Arc<Mutex<B2buaCallStore>>;
 
 /// STIR/SHAKEN signing credentials for outbound PASSporTs (RFC 8224).
 pub struct B2buaStirConfig {
@@ -58,7 +61,7 @@ pub async fn run_udp_b2bua(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let downstream = rt.downstream;
     let upstream_set: HashSet<SocketAddr> = [downstream].into_iter().collect();
-    let relay: Arc<Mutex<HashMap<String, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    let calls: SharedCallStore = Arc::new(Mutex::new(B2buaCallStore::default()));
     let udp = UdpTransport::bind(addr).await?;
     let socket = udp.into_inner();
     let mut buf = vec![0u8; 65535];
@@ -77,41 +80,87 @@ pub async fn run_udp_b2bua(
                 };
 
                 if upstream_set.contains(&peer) {
-                    if let SipMessage::Response(resp) = &msg {
-                        let cid = resp.call_id().unwrap_or("").to_string();
-                        if cid.is_empty() {
-                            continue;
-                        }
-                        let client = relay.lock().await.get(&cid).copied();
-                        if let Some(client) = client {
-                            let _ = socket.send_to(data, client).await;
-                        }
-                    }
+                    relay_downstream_response(&socket, &calls, data, &msg).await;
                     continue;
                 }
 
-                match msg {
-                    SipMessage::Request(req) => {
-                        let cid = req.call_id().unwrap_or("").to_string();
-                        if cid.is_empty() {
-                            tracing::debug!(%peer, "b2bua: missing Call-ID");
-                            continue;
-                        }
-                        relay.lock().await.insert(cid, peer);
-
-                        if req.method == Method::Invite {
-                            if let Err(e) = forward_invite(&socket, &rt, peer, req).await {
-                                tracing::warn!(%peer, "b2bua invite: {e}");
-                            }
-                        } else if let Err(e) = socket.send_to(data, downstream).await {
-                            tracing::debug!(%downstream, "b2bua forward: {e}");
-                        }
+                if let SipMessage::Request(req) = msg {
+                    if req.call_id().unwrap_or("").is_empty() {
+                        tracing::debug!(%peer, "b2bua: missing Call-ID");
+                        continue;
                     }
-                    SipMessage::Response(_) => {}
+                    handle_client_request(&socket, &rt, &calls, peer, data, req).await;
                 }
             }
         }
     }
+}
+
+async fn relay_downstream_response(
+    socket: &tokio::net::UdpSocket,
+    calls: &SharedCallStore,
+    data: &[u8],
+    msg: &SipMessage,
+) {
+    let SipMessage::Response(resp) = msg else {
+        return;
+    };
+    if resp.call_id().unwrap_or("").is_empty() {
+        return;
+    }
+    let client = calls.lock().await.client_addr_for_response(resp);
+    if let Some(client) = client {
+        let _ = socket.send_to(data, client).await;
+    }
+}
+
+async fn handle_client_request(
+    socket: &tokio::net::UdpSocket,
+    rt: &B2buaUdpRuntime,
+    calls: &SharedCallStore,
+    peer: SocketAddr,
+    data: &[u8],
+    req: Request,
+) {
+    if req.method == Method::Invite {
+        forward_client_invite(socket, rt, calls, peer, req).await;
+    } else {
+        forward_client_non_invite(socket, rt.downstream, calls, peer, data, &req).await;
+    }
+}
+
+async fn forward_client_invite(
+    socket: &tokio::net::UdpSocket,
+    rt: &B2buaUdpRuntime,
+    calls: &SharedCallStore,
+    peer: SocketAddr,
+    req: Request,
+) {
+    let client_req = req.clone();
+    match forward_invite(socket, rt, peer, req).await {
+        Ok(Some(downstream_req)) => {
+            calls
+                .lock()
+                .await
+                .record_invite(&client_req, &downstream_req, peer, rt.downstream);
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(%peer, "b2bua invite: {e}"),
+    }
+}
+
+async fn forward_client_non_invite(
+    socket: &tokio::net::UdpSocket,
+    downstream: SocketAddr,
+    calls: &SharedCallStore,
+    peer: SocketAddr,
+    data: &[u8],
+    req: &Request,
+) {
+    if let Err(e) = socket.send_to(data, downstream).await {
+        tracing::debug!(%downstream, "b2bua forward: {e}");
+    }
+    calls.lock().await.record_pending_request(req, peer);
 }
 
 async fn forward_invite(
@@ -119,7 +168,7 @@ async fn forward_invite(
     rt: &B2buaUdpRuntime,
     peer: SocketAddr,
     mut req: Request,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Request>> {
     if rt.router.check_max_forwards(&req).is_some() {
         respond(
             socket,
@@ -127,13 +176,19 @@ async fn forward_invite(
             &SipMessage::Response(ProxyRouter::too_many_hops_response(&req)),
         )
         .await;
-        return Ok(());
+        return Ok(None);
     }
 
     if !req.body.is_empty()
         && let Ok(s) = std::str::from_utf8(&req.body)
         && s.contains("v=0")
     {
+        let media_profile = sdp_media_profile(s);
+        tracing::debug!(
+            ice_capable = media_profile.is_ice_capable,
+            dtls_srtp = media_profile.has_dtls_srtp,
+            "b2bua: observed SDP media profile for future rtpengine integration"
+        );
         let (new_sdp, removed) = rt.policy.filter_sdp_codecs(s);
         if !removed.is_empty() {
             tracing::debug!(?removed, "b2bua: filtered codecs from SDP");
@@ -162,9 +217,10 @@ async fn forward_invite(
     req.headers = headers;
     ProxyRouter::decrement_max_forwards(&mut req.headers);
 
+    let downstream_req = req.clone();
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, rt.downstream).await?;
-    Ok(())
+    Ok(Some(downstream_req))
 }
 
 /// Extract a telephone number or SIP user-part from a URI for use as a PASSporT TN.
@@ -238,4 +294,59 @@ fn set_body(req: &mut Request, body: Vec<u8>) {
 
 async fn respond(socket: &tokio::net::UdpSocket, peer: SocketAddr, msg: &SipMessage) {
     let _ = socket.send_to(&serialize_message(msg), peer).await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SdpMediaProfile {
+    is_ice_capable: bool,
+    has_dtls_srtp: bool,
+}
+
+fn sdp_media_profile(sdp: &str) -> SdpMediaProfile {
+    SdpMediaProfile {
+        is_ice_capable: has_any_sdp_attr(sdp, &["candidate", "ice-ufrag", "ice-pwd"]),
+        has_dtls_srtp: has_any_sdp_attr(sdp, &["fingerprint"]),
+    }
+}
+
+fn has_any_sdp_attr(sdp: &str, names: &[&str]) -> bool {
+    sdp.lines().any(|line| {
+        let line = line.trim();
+        names.iter().any(|name| {
+            line.strip_prefix("a=")
+                .and_then(|attr| attr.strip_prefix(name))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdp_media_profile_for_plain_sdp_has_no_ice_or_dtls_srtp_markers() {
+        let sdp = "v=0\r\nm=audio 4000 RTP/AVP 0\r\n";
+
+        let profile = sdp_media_profile(sdp);
+
+        assert!(!profile.is_ice_capable);
+        assert!(!profile.has_dtls_srtp);
+    }
+
+    #[test]
+    fn sdp_media_profile_detects_ice_capable_dtls_srtp_sdp() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 4000 UDP/TLS/RTP/SAVPF 111\r\n",
+            "a=ice-ufrag:abc\r\n",
+            "a=ice-pwd:def\r\n",
+            "a=fingerprint:sha-256 00:11\r\n",
+        );
+
+        let profile = sdp_media_profile(sdp);
+
+        assert!(profile.is_ice_capable);
+        assert!(profile.has_dtls_srtp);
+    }
 }

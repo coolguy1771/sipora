@@ -150,10 +150,6 @@ pub async fn prepare_response(
         pending.last_reliable_rseq = Some(rseq);
     }
 
-    if response.status.is_success() && pending.final_forwarded {
-        return None;
-    }
-
     remove_top_via(response)?;
     restore_original_via_stack(response, &pending.original_via_stack);
     if response.status.is_success() {
@@ -314,7 +310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_success_response_is_absorbed() {
+    async fn repeated_success_response_is_prepared_for_client() {
         let table = new_forward_table();
         let client_addr = "127.0.0.1:5060".parse().unwrap();
         insert_forward(
@@ -334,7 +330,8 @@ mod tests {
         prepare_response(&table, "z9hG4bK-proxy", &mut first).await;
         let target = prepare_response(&table, "z9hG4bK-proxy", &mut second).await;
 
-        assert_eq!(target, None);
+        assert_eq!(target, Some(client_addr));
+        assert!(matches!(second.headers[0], Header::Via(_)));
     }
 
     #[tokio::test]

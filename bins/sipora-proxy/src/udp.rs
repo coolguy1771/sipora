@@ -3,8 +3,8 @@
 
 use fred::prelude::{Expiration, KeysInterface, LuaInterface, SetOptions};
 use sipora_auth::digest::{
-    DigestChallenge, DigestResponse, EffectiveHa1Error, effective_stored_ha1_for_digest,
-    validate_nc, verify_digest,
+    DigestAlgorithm, DigestChallenge, DigestResponse, EffectiveHa1Error,
+    effective_stored_ha1_for_digest, validate_nc, verify_digest,
 };
 use sipora_auth::stir::{CertCache, StirError, verify_identity_header};
 use sipora_core::redis::RedisPool;
@@ -12,7 +12,7 @@ use sipora_core::redis_keys::{
     LUA_REGISTER_COMMIT_LOCK_DELETE_IF_MATCH, register_commit_lock_key, register_digest_nonce_key,
     register_digest_nonce_nc_key, register_transaction_ok_key,
 };
-use sipora_data::pg::get_user_sip_digest_ha1;
+use sipora_data::pg::{SipDigestCredentials, get_user_sip_digest_credentials};
 use sipora_location::ContactBinding;
 use sipora_location::redis_store::{list_contact_uris, upsert_contact};
 use sipora_sip::overload::overload_response;
@@ -27,8 +27,10 @@ use sipora_sip::types::status::StatusCode;
 use sipora_transport::dns::{SipTransport, resolve_sip_targets};
 use sipora_transport::udp::UdpTransport;
 use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
@@ -89,14 +91,67 @@ pub struct UdpProxyConfig {
     pub max_forwards: u8,
     pub registrar: RegistrarLimits,
     pub nonce_ttl_s: u64,
+    pub fork_parallel: bool,
     pub pg: PgPool,
     pub stir: StirConfig,
 }
 
 pub type TransactionTable = Arc<RwLock<TransactionManager>>;
 
+#[derive(Debug)]
+struct PreparedForkFailure {
+    response: Response,
+    target: SocketAddr,
+}
+
+#[derive(Debug, Default)]
+pub struct CallForkState {
+    branches: Vec<String>,
+    completed: HashSet<String>,
+    success_seen: bool,
+    best_failure: Option<PreparedForkFailure>,
+}
+
+pub type ForkTable = Arc<RwLock<HashMap<String, CallForkState>>>;
+
+pub fn new_fork_table() -> ForkTable {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 pub fn new_transaction_table() -> TransactionTable {
     Arc::new(RwLock::new(TransactionManager::new()))
+}
+
+const FORK_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(32);
+
+pub async fn cleanup_stale_fork_states(fork_table: &ForkTable, forward_table: &ForwardTable) {
+    let live_branches: HashSet<String> = forward_table.read().await.keys().cloned().collect();
+    fork_table.write().await.retain(|_, state| {
+        state
+            .branches
+            .iter()
+            .any(|branch| live_branches.contains(branch))
+    });
+}
+
+fn spawn_fork_sweeper(
+    fork_table: ForkTable,
+    forward_table: ForwardTable,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(FORK_STATE_SWEEP_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = interval.tick() => cleanup_stale_fork_states(&fork_table, &forward_table).await,
+            }
+        }
+    })
 }
 
 pub async fn run_udp_proxy(
@@ -112,7 +167,10 @@ pub async fn run_udp_proxy(
     let socket = Arc::new(udp.into_inner());
     let router = ProxyRouter::new(cfg.max_forwards);
     let refresh_table = new_refresh_table();
+    let fork_table = new_fork_table();
     let _forward_sweeper = spawn_forward_sweeper(forward_table.clone(), shutdown.clone());
+    let _fork_sweeper =
+        spawn_fork_sweeper(fork_table.clone(), forward_table.clone(), shutdown.clone());
     let mut buf = vec![0u8; 65535];
     loop {
         tokio::select! {
@@ -137,6 +195,7 @@ pub async fn run_udp_proxy(
                             &forward_table,
                             &dialog_table,
                             &transaction_table,
+                            &fork_table,
                             &refresh_table,
                             peer,
                             req,
@@ -148,6 +207,7 @@ pub async fn run_udp_proxy(
                             &socket,
                             &cfg,
                             &forward_table,
+                            &fork_table,
                             &dialog_table,
                             &transaction_table,
                             &refresh_table,
@@ -173,12 +233,13 @@ async fn dispatch_request(
     forward_table: &ForwardTable,
     dialog_table: &DialogTable,
     transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
     refresh_table: &RefreshTable,
     peer: SocketAddr,
     mut req: Request,
 ) -> anyhow::Result<()> {
     apply_rfc3581(&mut req, peer);
-    if let Some(status) = enforce_sips_policy(&req) {
+    if let Some(status) = enforce_sips_policy(&req, Transport::Udp) {
         respond(socket, peer, &sip_response(&req, status)).await;
         return Ok(());
     }
@@ -192,6 +253,7 @@ async fn dispatch_request(
                 cfg,
                 forward_table,
                 transaction_table,
+                fork_table,
                 peer,
                 req,
             )
@@ -299,50 +361,427 @@ fn top_via_mut(headers: &mut [Header]) -> Option<&mut Via> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_response(
     socket: &Arc<tokio::net::UdpSocket>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
+    fork_table: &ForkTable,
     dialog_table: &DialogTable,
     transaction_table: &TransactionTable,
     refresh_table: &RefreshTable,
-    mut resp: Response,
+    resp: Response,
 ) -> anyhow::Result<()> {
-    let Some(top_via) = response_top_via(&resp) else {
+    let Some(branch) = response_proxy_branch(&resp, cfg) else {
         return Ok(());
     };
-    if !via_matches_proxy(top_via, &cfg.advertise, cfg.sip_port) {
-        return Ok(());
-    }
-    let branch = top_via.branch.clone();
-    if branch.is_empty() {
-        return Ok(());
-    }
     remove_client_transaction(transaction_table, &resp).await;
+    if is_cancel_success_response(&resp) {
+        return Ok(());
+    }
 
     let pending = get_pending_forward(forward_table, &branch).await;
+    if is_parallel_branch(fork_table, &resp, &branch).await {
+        return handle_parallel_response(
+            socket,
+            cfg,
+            forward_table,
+            fork_table,
+            dialog_table,
+            transaction_table,
+            refresh_table,
+            branch,
+            resp,
+            pending,
+        )
+        .await;
+    }
+
     if should_try_next_fork(&resp, pending.as_ref()) {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let _ = prepare_response(forward_table, &branch, &mut resp).await;
-        return forward_next_fork(socket, cfg, forward_table, transaction_table, pending).await;
+        return handle_fork_failure_response(
+            socket,
+            cfg,
+            forward_table,
+            transaction_table,
+            &branch,
+            resp,
+            pending,
+        )
+        .await;
     }
 
-    let first_success = pending
+    relay_final_response(
+        socket,
+        dialog_table,
+        refresh_table,
+        forward_table,
+        &branch,
+        resp,
+        pending,
+    )
+    .await
+}
+
+fn response_proxy_branch(resp: &Response, cfg: &UdpProxyConfig) -> Option<String> {
+    let top_via = response_top_via(resp)?;
+    if !via_matches_proxy(top_via, &cfg.advertise, cfg.sip_port) {
+        return None;
+    }
+    (!top_via.branch.is_empty()).then(|| top_via.branch.clone())
+}
+
+async fn is_parallel_branch(fork_table: &ForkTable, resp: &Response, branch: &str) -> bool {
+    let Some(call_id) = resp.call_id() else {
+        return false;
+    };
+    fork_table
+        .read()
+        .await
+        .get(call_id)
+        .is_some_and(|state| state.branches.iter().any(|b| b == branch))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_parallel_response(
+    socket: &Arc<tokio::net::UdpSocket>,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    fork_table: &ForkTable,
+    dialog_table: &DialogTable,
+    transaction_table: &TransactionTable,
+    refresh_table: &RefreshTable,
+    branch: String,
+    resp: Response,
+    pending: Option<PendingForward>,
+) -> anyhow::Result<()> {
+    if resp.status.is_provisional() {
+        return relay_parallel_response(
+            socket,
+            dialog_table,
+            refresh_table,
+            forward_table,
+            &branch,
+            resp,
+            pending,
+        )
+        .await;
+    }
+    if resp.status.is_success() {
+        mark_parallel_success(fork_table, &resp, &branch).await;
+        return relay_parallel_response(
+            socket,
+            dialog_table,
+            refresh_table,
+            forward_table,
+            &branch,
+            resp,
+            pending,
+        )
+        .await;
+    }
+    if parallel_success_seen(fork_table, &resp).await {
+        absorb_parallel_final_after_success(fork_table, forward_table, &resp, &branch).await;
+        return Ok(());
+    }
+    if resp.status.is_global_error() {
+        remove_fork_state(fork_table, &resp).await;
+        cancel_parallel_siblings(
+            socket,
+            cfg,
+            forward_table,
+            transaction_table,
+            &branch,
+            &pending,
+        )
+        .await?;
+        return relay_parallel_response(
+            socket,
+            dialog_table,
+            refresh_table,
+            forward_table,
+            &branch,
+            resp,
+            pending,
+        )
+        .await;
+    }
+    handle_parallel_failure(socket, forward_table, fork_table, &branch, resp).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_parallel_response(
+    socket: &Arc<tokio::net::UdpSocket>,
+    dialog_table: &DialogTable,
+    refresh_table: &RefreshTable,
+    forward_table: &ForwardTable,
+    branch: &str,
+    resp: Response,
+    pending: Option<PendingForward>,
+) -> anyhow::Result<()> {
+    relay_final_response(
+        socket,
+        dialog_table,
+        refresh_table,
+        forward_table,
+        branch,
+        resp,
+        pending,
+    )
+    .await
+}
+
+async fn mark_parallel_success(fork_table: &ForkTable, resp: &Response, branch: &str) {
+    let Some(call_id) = resp.call_id().map(str::to_owned) else {
+        return;
+    };
+    let mut table = fork_table.write().await;
+    let Some(state) = table.get_mut(&call_id) else {
+        return;
+    };
+    state.success_seen = true;
+    state.completed.insert(branch.to_string());
+    if state.completed.len() == state.branches.len() {
+        table.remove(&call_id);
+    }
+}
+
+async fn parallel_success_seen(fork_table: &ForkTable, resp: &Response) -> bool {
+    let Some(call_id) = resp.call_id() else {
+        return false;
+    };
+    fork_table
+        .read()
+        .await
+        .get(call_id)
+        .is_some_and(|state| state.success_seen)
+}
+
+async fn absorb_parallel_final_after_success(
+    fork_table: &ForkTable,
+    forward_table: &ForwardTable,
+    resp: &Response,
+    branch: &str,
+) {
+    mark_parallel_completed(fork_table, resp, branch).await;
+    remove_forward_branch(forward_table, branch).await;
+}
+
+async fn mark_parallel_completed(fork_table: &ForkTable, resp: &Response, branch: &str) {
+    let Some(call_id) = resp.call_id().map(str::to_owned) else {
+        return;
+    };
+    let mut table = fork_table.write().await;
+    let Some(state) = table.get_mut(&call_id) else {
+        return;
+    };
+    state.completed.insert(branch.to_string());
+    if state.completed.len() == state.branches.len() {
+        table.remove(&call_id);
+    }
+}
+
+async fn remove_fork_state(fork_table: &ForkTable, resp: &Response) {
+    let Some(call_id) = resp.call_id() else {
+        return;
+    };
+    fork_table.write().await.remove(call_id);
+}
+
+async fn remove_forward_branch(forward_table: &ForwardTable, branch: &str) {
+    forward_table.write().await.remove(branch);
+}
+
+fn is_cancel_success_response(resp: &Response) -> bool {
+    resp.status.is_success()
+        && resp
+            .cseq()
+            .is_some_and(|cseq| cseq.method == Method::Cancel)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cancel_parallel_siblings(
+    socket: &Arc<tokio::net::UdpSocket>,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    branch: &str,
+    pending: &Option<PendingForward>,
+) -> anyhow::Result<()> {
+    let Some(original_request) = pending.as_ref().and_then(|p| p.original_request.as_ref()) else {
+        return Ok(());
+    };
+    let Some(call_id) = original_request.call_id() else {
+        return Ok(());
+    };
+    for sibling in find_branches_by_call_id(forward_table, call_id).await {
+        if sibling != branch {
+            cancel_parallel_sibling(
+                socket,
+                cfg,
+                forward_table,
+                transaction_table,
+                &sibling,
+                original_request,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cancel_parallel_sibling(
+    socket: &Arc<tokio::net::UdpSocket>,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    branch: &str,
+    original_request: &Request,
+) -> anyhow::Result<()> {
+    let pending = get_pending_forward(forward_table, branch).await;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let cancel = build_cancel_request(original_request, branch, &pending.forwarded_uri, cfg);
+    track_client_transaction(transaction_table, &cancel, TransactionType::ClientNonInvite).await;
+    let bytes = serialize_message(&SipMessage::Request(cancel));
+    socket.send_to(&bytes, pending.target_addr).await?;
+    remove_forward_branch(forward_table, branch).await;
+    Ok(())
+}
+
+async fn handle_parallel_failure(
+    socket: &Arc<tokio::net::UdpSocket>,
+    forward_table: &ForwardTable,
+    fork_table: &ForkTable,
+    branch: &str,
+    mut resp: Response,
+) -> anyhow::Result<()> {
+    let Some(call_id) = resp.call_id().map(str::to_owned) else {
+        return Ok(());
+    };
+    let Some(target) = prepare_parallel_failure(forward_table, branch, &mut resp).await else {
+        return Ok(());
+    };
+    let final_failure = record_parallel_failure(fork_table, &call_id, branch, resp, target).await;
+    if let Some(failure) = final_failure {
+        return send_response(socket, failure.response, failure.target).await;
+    }
+    Ok(())
+}
+
+async fn prepare_parallel_failure(
+    forward_table: &ForwardTable,
+    branch: &str,
+    resp: &mut Response,
+) -> Option<SocketAddr> {
+    let mut target = prepare_response(forward_table, branch, resp).await?;
+    if let Some(via) = response_top_via(resp) {
+        target = response_relay_addr(via).unwrap_or(target);
+    }
+    Some(target)
+}
+
+async fn record_parallel_failure(
+    fork_table: &ForkTable,
+    call_id: &str,
+    branch: &str,
+    resp: Response,
+    target: SocketAddr,
+) -> Option<PreparedForkFailure> {
+    let mut table = fork_table.write().await;
+    let state = table.get_mut(call_id)?;
+    state.completed.insert(branch.to_string());
+    record_best_failure(
+        state,
+        PreparedForkFailure {
+            response: resp,
+            target,
+        },
+    );
+    if state.completed.len() != state.branches.len() {
+        return None;
+    }
+    if state.success_seen {
+        table.remove(call_id);
+        return None;
+    }
+    table
+        .remove(call_id)
+        .and_then(|mut state| state.best_failure.take())
+}
+
+fn record_best_failure(state: &mut CallForkState, failure: PreparedForkFailure) {
+    if state
+        .best_failure
         .as_ref()
-        .is_some_and(|p| resp.status.is_success() && !p.final_forwarded);
-    let Some(mut target) = prepare_response(forward_table, &branch, &mut resp).await else {
+        .is_none_or(|best| failure_preferred(&failure.response, &best.response))
+    {
+        state.best_failure = Some(failure);
+    }
+}
+
+// Deterministic non-2xx fork merge policy: 6xx is handled immediately before
+// this path; among deferred failures, prefer 5xx over 4xx over 3xx. Ties keep
+// the lower status code, then first-seen response.
+fn failure_preferred(candidate: &Response, current: &Response) -> bool {
+    let candidate_rank = failure_status_rank(candidate.status);
+    let current_rank = failure_status_rank(current.status);
+    candidate_rank > current_rank
+        || (candidate_rank == current_rank && candidate.status.0 < current.status.0)
+}
+
+fn failure_status_rank(status: StatusCode) -> u8 {
+    match status.class() {
+        5 => 3,
+        4 => 2,
+        3 => 1,
+        _ => 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_fork_failure_response(
+    socket: &Arc<tokio::net::UdpSocket>,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    branch: &str,
+    mut resp: Response,
+    pending: PendingForward,
+) -> anyhow::Result<()> {
+    let Some(mut target) = prepare_response(forward_table, branch, &mut resp).await else {
+        return Ok(());
+    };
+    if forward_next_fork(socket, cfg, forward_table, transaction_table, pending).await? {
+        return Ok(());
+    }
+    if let Some(via) = response_top_via(&resp) {
+        target = response_relay_addr(via).unwrap_or(target);
+    }
+    send_response(socket, resp, target).await
+}
+
+async fn relay_final_response(
+    socket: &Arc<tokio::net::UdpSocket>,
+    dialog_table: &DialogTable,
+    refresh_table: &RefreshTable,
+    forward_table: &ForwardTable,
+    branch: &str,
+    mut resp: Response,
+    pending: Option<PendingForward>,
+) -> anyhow::Result<()> {
+    let success_response = pending.as_ref().is_some_and(|_| resp.status.is_success());
+    let Some(mut target) = prepare_response(forward_table, branch, &mut resp).await else {
         return Ok(());
     };
     if let Some(via) = response_top_via(&resp) {
         target = response_relay_addr(via).unwrap_or(target);
     }
-    if first_success && let Some(pending) = pending {
-        let session_expires = resp.headers.iter().find_map(|h| match h {
-            Header::SessionExpires { delta_seconds, .. } => Some(*delta_seconds),
-            _ => None,
-        });
+    if success_response && let Some(pending) = pending {
+        let session_expires = response_session_expires(&resp);
         if let (Some(dialog_key), Some(se)) = (
             insert_dialog_from_response(
                 dialog_table,
@@ -356,6 +795,21 @@ async fn dispatch_response(
             spawn_session_guard(dialog_table, refresh_table, dialog_key, se).await;
         }
     }
+    send_response(socket, resp, target).await
+}
+
+fn response_session_expires(resp: &Response) -> Option<u32> {
+    resp.headers.iter().find_map(|h| match h {
+        Header::SessionExpires { delta_seconds, .. } => Some(*delta_seconds),
+        _ => None,
+    })
+}
+
+async fn send_response(
+    socket: &Arc<tokio::net::UdpSocket>,
+    resp: Response,
+    target: SocketAddr,
+) -> anyhow::Result<()> {
     let bytes = serialize_message(&SipMessage::Response(resp));
     socket.send_to(&bytes, target).await?;
     Ok(())
@@ -374,9 +828,9 @@ async fn forward_next_fork(
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     pending: PendingForward,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let Some(original_request) = pending.original_request.clone() else {
-        return Ok(());
+        return Ok(false);
     };
     for (index, target_uri) in pending.remaining_targets.iter().enumerate() {
         let Some(target) = resolve_udp_target(target_uri).await else {
@@ -388,7 +842,7 @@ async fn forward_next_fork(
             .skip(index + 1)
             .cloned()
             .collect();
-        return forward_invite_request(
+        forward_invite_request(
             socket,
             forward_table,
             transaction_table,
@@ -401,9 +855,10 @@ async fn forward_next_fork(
             &cfg.advertise,
             cfg.sip_port,
         )
-        .await;
+        .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn response_top_via(resp: &Response) -> Option<&Via> {
@@ -558,9 +1013,42 @@ async fn handle_invite(
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
     peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<()> {
+    let Some(req) = prepare_invite_ingress(socket, cfg, peer, req).await? else {
+        return Ok(());
+    };
+    if reject_invite_for_max_forwards(socket, router, peer, &req).await {
+        return Ok(());
+    }
+    let Some(contacts) = lookup_invite_contacts(socket, pool, cfg, peer, &req).await? else {
+        return Ok(());
+    };
+    let Some(route) = select_invite_route(socket, peer, &req, contacts).await else {
+        return Ok(());
+    };
+
+    forward_initial_invite(
+        socket,
+        forward_table,
+        transaction_table,
+        fork_table,
+        cfg,
+        peer,
+        req,
+        route,
+    )
+    .await
+}
+
+async fn prepare_invite_ingress(
+    socket: &Arc<tokio::net::UdpSocket>,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: Request,
+) -> anyhow::Result<Option<Request>> {
     // RFC 3261 §17.2.1: send 100 Trying immediately on INVITE receipt
     respond(socket, peer, &sip_response(&req, StatusCode::TRYING)).await;
 
@@ -571,31 +1059,50 @@ async fn handle_invite(
     // RFC 8224: verify or require STIR Identity header per configured policy.
     if let Some(reject_code) = check_stir_identity(&mut req, &cfg.stir).await {
         respond(socket, peer, &sip_response(&req, reject_code)).await;
-        return Ok(());
+        return Ok(None);
     }
 
     // RFC 4028 §8: reject if Session-Expires is below proxy minimum
     if check_session_expires(&req).is_some() {
         respond(socket, peer, &sip_response_with_min_se(&req, PROXY_MIN_SE)).await;
-        return Ok(());
+        return Ok(None);
     }
-    if router.check_max_forwards(&req).is_some() {
-        respond(
-            socket,
-            peer,
-            &SipMessage::Response(ProxyRouter::too_many_hops_response(&req)),
-        )
-        .await;
-        return Ok(());
+    Ok(Some(req))
+}
+
+async fn reject_invite_for_max_forwards(
+    socket: &Arc<tokio::net::UdpSocket>,
+    router: &ProxyRouter,
+    peer: SocketAddr,
+    req: &Request,
+) -> bool {
+    if router.check_max_forwards(req).is_none() {
+        return false;
     }
+    respond(
+        socket,
+        peer,
+        &SipMessage::Response(ProxyRouter::too_many_hops_response(req)),
+    )
+    .await;
+    true
+}
+
+async fn lookup_invite_contacts(
+    socket: &Arc<tokio::net::UdpSocket>,
+    pool: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+) -> anyhow::Result<Option<Vec<ContactBinding>>> {
     let Some((user, dom)) = parse_sip_user_host(&req.uri) else {
         respond(
             socket,
             peer,
-            &SipMessage::Response(ProxyRouter::not_found_response(&req)),
+            &SipMessage::Response(ProxyRouter::not_found_response(req)),
         )
         .await;
-        return Ok(());
+        return Ok(None);
     };
     let dom = normalize_domain(dom, &cfg.domain);
     let contacts = match list_contact_uris(pool, &dom, &user).await {
@@ -605,53 +1112,200 @@ async fn handle_invite(
             respond(
                 socket,
                 peer,
-                &SipMessage::Response(ProxyRouter::service_unavailable(&req, 30)),
+                &SipMessage::Response(ProxyRouter::service_unavailable(req, 30)),
             )
             .await;
-            return Ok(());
+            return Ok(None);
         }
     };
     if contacts.is_empty() {
         respond(
             socket,
             peer,
-            &SipMessage::Response(ProxyRouter::not_found_response(&req)),
+            &SipMessage::Response(ProxyRouter::not_found_response(req)),
         )
         .await;
+        return Ok(None);
+    }
+    Ok(Some(contacts))
+}
+
+async fn select_invite_route(
+    socket: &Arc<tokio::net::UdpSocket>,
+    peer: SocketAddr,
+    req: &Request,
+    contacts: Vec<ContactBinding>,
+) -> Option<InitialInviteRoute> {
+    match select_initial_invite_target(req, contacts).await {
+        InitialInviteTarget::Selected(route) => Some(route),
+        InitialInviteTarget::Downgrade(status) => {
+            respond(socket, peer, &sip_response(req, status)).await;
+            None
+        }
+        InitialInviteTarget::Unusable => {
+            respond(
+                socket,
+                peer,
+                &SipMessage::Response(ProxyRouter::service_unavailable(req, 30)),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_initial_invite(
+    socket: &Arc<tokio::net::UdpSocket>,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: Request,
+    route: InitialInviteRoute,
+) -> anyhow::Result<()> {
+    if !cfg.fork_parallel {
+        let original_request = req.clone();
+        forward_invite_request(
+            socket,
+            forward_table,
+            transaction_table,
+            peer,
+            req,
+            route.target_uri,
+            route.target,
+            Some(original_request),
+            route.remaining_targets,
+            &cfg.advertise,
+            cfg.sip_port,
+        )
+        .await?;
         return Ok(());
     }
-    let mut contacts = contacts;
-    contacts.sort_by(|a, b| {
-        b.q_value
-            .partial_cmp(&a.q_value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let target_uri = contacts[0].uri.clone();
-    let remaining_targets = contacts.iter().skip(1).map(|c| c.uri.clone()).collect();
-    let Some(target) = resolve_udp_target(&target_uri).await else {
-        respond(
-            socket,
-            peer,
-            &SipMessage::Response(ProxyRouter::service_unavailable(&req, 30)),
-        )
-        .await;
-        return Ok(());
-    };
+
+    forward_parallel_initial_invite(
+        socket,
+        forward_table,
+        transaction_table,
+        fork_table,
+        cfg,
+        peer,
+        req,
+        route,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_parallel_initial_invite(
+    socket: &Arc<tokio::net::UdpSocket>,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: Request,
+    route: InitialInviteRoute,
+) -> anyhow::Result<()> {
+    let call_id = req.call_id().map(str::to_owned);
     let original_request = req.clone();
-    forward_invite_request(
+    let mut branches = Vec::new();
+    let first_branch = forward_invite_request(
         socket,
         forward_table,
         transaction_table,
         peer,
         req,
-        target_uri,
-        target,
-        Some(original_request),
-        remaining_targets,
+        route.target_uri,
+        route.target,
+        Some(original_request.clone()),
+        vec![],
         &cfg.advertise,
         cfg.sip_port,
     )
-    .await
+    .await?;
+    branches.push(first_branch);
+
+    for target_uri in route.remaining_targets {
+        if let Some(target) = resolve_udp_target(&target_uri).await {
+            let branch = forward_invite_request(
+                socket,
+                forward_table,
+                transaction_table,
+                peer,
+                original_request.clone(),
+                target_uri,
+                target,
+                Some(original_request.clone()),
+                vec![],
+                &cfg.advertise,
+                cfg.sip_port,
+            )
+            .await?;
+            branches.push(branch);
+        }
+    }
+    if let Some(call_id) = call_id {
+        record_fork_branches(fork_table, &call_id, branches).await;
+    }
+    Ok(())
+}
+
+pub async fn record_fork_branches<S>(fork_table: &ForkTable, call_id: &str, branches: Vec<S>)
+where
+    S: Into<String>,
+{
+    let branches = branches.into_iter().map(Into::into).collect();
+    let state = CallForkState {
+        branches,
+        ..CallForkState::default()
+    };
+    fork_table.write().await.insert(call_id.to_string(), state);
+}
+
+enum InitialInviteTarget {
+    Selected(InitialInviteRoute),
+    Downgrade(StatusCode),
+    Unusable,
+}
+
+struct InitialInviteRoute {
+    target_uri: String,
+    target: SocketAddr,
+    remaining_targets: Vec<String>,
+}
+
+async fn select_initial_invite_target(
+    req: &Request,
+    mut contacts: Vec<ContactBinding>,
+) -> InitialInviteTarget {
+    contacts.sort_by(|a, b| {
+        b.q_value
+            .partial_cmp(&a.q_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for (index, contact) in contacts.iter().enumerate() {
+        if let Some(status) = sips_downgrade_status(req, &contact.uri) {
+            return InitialInviteTarget::Downgrade(status);
+        }
+        let Some(target) = resolve_udp_target(&contact.uri).await else {
+            continue;
+        };
+        let remaining_targets = contacts
+            .iter()
+            .skip(index + 1)
+            .map(|c| c.uri.clone())
+            .collect();
+        return InitialInviteTarget::Selected(InitialInviteRoute {
+            target_uri: contact.uri.clone(),
+            target,
+            remaining_targets,
+        });
+    }
+
+    InitialInviteTarget::Unusable
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -667,29 +1321,15 @@ async fn forward_invite_request(
     remaining_targets: Vec<String>,
     advertise: &str,
     sip_port: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     req.uri = target_uri;
     let branch = format!("z9hG4bK{}", Uuid::new_v4().as_simple());
-    let original_via_stack = collect_via_stack(&req.headers);
-    let via = Header::Via(Via {
-        transport: Transport::Udp,
-        host: advertise.to_string(),
-        port: Some(sip_port),
-        branch: branch.clone(),
-        received: None,
-        rport: sipora_sip::types::header::RportParam::Absent,
-        params: vec![],
-    });
-    let record_route = Header::RecordRoute(vec![format!("<sip:{advertise}:{sip_port};lr>")]);
-    let mut headers = vec![via, record_route];
-    headers.extend(req.headers);
-    req.headers = headers;
-    ProxyRouter::decrement_max_forwards(&mut req.headers);
-    // Extract transaction key before req is consumed by serialization
+    let original_via_stack = insert_forwarding_headers(&mut req, &branch, advertise, sip_port);
     let tx_key = TransactionKey::from_request(&req);
+
     insert_forward(
         forward_table,
-        branch,
+        branch.clone(),
         peer,
         target,
         original_via_stack,
@@ -698,22 +1338,66 @@ async fn forward_invite_request(
         req.uri.clone(),
     )
     .await;
+
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
-    // Spawn RFC 3261 §17.1.1.2 Timer A: retransmit INVITE at T1, 2T1, 4T1, … capped at T2
-    let socket_arc = Arc::clone(socket);
-    let timer = tokio::spawn(async move {
+    let timer = spawn_invite_retransmit_timer(socket, bytes, target);
+    track_invite_client_transaction(transaction_table, tx_key, timer).await;
+    Ok(branch)
+}
+
+fn insert_forwarding_headers(
+    req: &mut Request,
+    branch: &str,
+    advertise: &str,
+    sip_port: u16,
+) -> Vec<Via> {
+    let original_via_stack = collect_via_stack(&req.headers);
+    let record_route = Header::RecordRoute(vec![format!("<sip:{advertise}:{sip_port};lr>")]);
+    let mut headers = vec![proxy_via(branch, advertise, sip_port), record_route];
+    headers.append(&mut req.headers);
+    req.headers = headers;
+    ProxyRouter::decrement_max_forwards(&mut req.headers);
+    original_via_stack
+}
+
+fn proxy_via(branch: &str, advertise: &str, sip_port: u16) -> Header {
+    Header::Via(Via {
+        transport: Transport::Udp,
+        host: advertise.to_string(),
+        port: Some(sip_port),
+        branch: branch.to_string(),
+        received: None,
+        rport: sipora_sip::types::header::RportParam::Absent,
+        params: vec![],
+    })
+}
+
+fn spawn_invite_retransmit_timer(
+    socket: &Arc<tokio::net::UdpSocket>,
+    bytes: Vec<u8>,
+    target: SocketAddr,
+) -> tokio::task::JoinHandle<()> {
+    let socket = Arc::clone(socket);
+    tokio::spawn(async move {
         let mut delay = sipora_sip::transaction::TIMER_T1;
         loop {
             tokio::time::sleep(delay).await;
-            if socket_arc.send_to(&bytes, target).await.is_err() {
+            if socket.send_to(&bytes, target).await.is_err() {
                 return;
             }
             delay = (delay * 2).min(sipora_sip::transaction::TIMER_T2);
         }
-    });
-    if let Some(key) = tx_key {
-        transaction_table.write().await.insert_with_timer(
+    })
+}
+
+async fn track_invite_client_transaction(
+    table: &TransactionTable,
+    key: Option<TransactionKey>,
+    timer: tokio::task::JoinHandle<()>,
+) {
+    if let Some(key) = key {
+        table.write().await.insert_with_timer(
             key,
             TransactionType::ClientInvite,
             timer.abort_handle(),
@@ -721,7 +1405,6 @@ async fn forward_invite_request(
     } else {
         timer.abort();
     }
-    Ok(())
 }
 
 fn prepend_proxy_via(req: &mut Request, advertise: &str, sip_port: u16) -> String {
@@ -915,12 +1598,34 @@ fn sip_response_multi_www_auth(req: &Request, challenges: &[String]) -> SipMessa
 const PROXY_MIN_SE: u32 = 90;
 
 /// RFC 5630 §4: reject sips: URIs arriving over UDP with 403 Forbidden.
-fn enforce_sips_policy(req: &Request) -> Option<StatusCode> {
-    if req.uri.starts_with("sips:") {
+fn enforce_sips_policy(req: &Request, ingress: Transport) -> Option<StatusCode> {
+    if is_sips_uri(&req.uri) && ingress == Transport::Udp {
         Some(StatusCode::FORBIDDEN)
     } else {
         None
     }
+}
+
+fn sips_downgrade_status(req: &Request, target_uri: &str) -> Option<StatusCode> {
+    if is_sips_uri(&req.uri) && is_sip_uri(target_uri) {
+        Some(StatusCode::TEMPORARILY_UNAVAILABLE)
+    } else {
+        None
+    }
+}
+
+fn is_sips_uri(uri: &str) -> bool {
+    has_uri_scheme(uri, "sips")
+}
+
+fn is_sip_uri(uri: &str) -> bool {
+    has_uri_scheme(uri, "sip")
+}
+
+fn has_uri_scheme(uri: &str, scheme: &str) -> bool {
+    let uri = strip_name_addr(uri);
+    uri.split_once(':')
+        .is_some_and(|(actual, _)| actual.eq_ignore_ascii_case(scheme))
 }
 
 /// RFC 4028 §8: if the request carries Session-Expires below PROXY_MIN_SE, return 422.
@@ -1078,7 +1783,9 @@ fn build_cancel_request(
     })];
     for h in &req.headers {
         match h {
-            Header::From(_) | Header::To(_) | Header::CallId(_) => headers.push(h.clone()),
+            Header::From(_) | Header::To(_) | Header::CallId(_) | Header::Route(_) => {
+                headers.push(h.clone())
+            }
             Header::CSeq(cseq) => headers.push(Header::CSeq(CSeq {
                 seq: cseq.seq,
                 method: Method::Cancel,
@@ -1135,7 +1842,9 @@ async fn handle_register(
     };
 
     match register_authorization_value(&req) {
-        None => register_send_digest_challenge(socket, redis, cfg, peer, &req, &dom).await,
+        None => {
+            register_send_digest_challenge(socket, redis, cfg, peer, &req, &user, &dom, false).await
+        }
         Some(auth_raw) => {
             register_complete_digest(
                 socket, redis, cfg, peer, &req, &user, &dom, &binding, expires, auth_raw,
@@ -1145,20 +1854,60 @@ async fn handle_register(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_send_digest_challenge(
     socket: &tokio::net::UdpSocket,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
     peer: SocketAddr,
     req: &Request,
+    user: &str,
     realm: &str,
+    stale: bool,
 ) -> anyhow::Result<()> {
-    register_send_digest_challenge_stale(socket, redis, cfg, peer, req, realm, false).await
+    let credentials = match get_user_sip_digest_credentials(&cfg.pg, user, realm).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(%e, "register db");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let algorithms = register_challenge_algorithms(credentials.as_ref());
+    register_send_digest_challenge_with_algorithms(
+        socket,
+        redis,
+        cfg,
+        peer,
+        req,
+        realm,
+        stale,
+        &algorithms,
+    )
+    .await
 }
 
-/// RFC 8760: send two challenges (SHA-256 preferred, MD5 for legacy UAs).
+fn register_challenge_algorithms(
+    credentials: Option<&SipDigestCredentials>,
+) -> Vec<DigestAlgorithm> {
+    match credentials {
+        Some(c) if c.sip_digest_ha1_sha256.is_some() && c.sip_digest_ha1.is_some() => {
+            vec![DigestAlgorithm::Sha256, DigestAlgorithm::Md5]
+        }
+        Some(c) if c.sip_digest_ha1_sha256.is_some() => vec![DigestAlgorithm::Sha256],
+        _ => vec![DigestAlgorithm::Md5],
+    }
+}
+
+/// RFC 8760: send SHA-256 first when available, with MD5 for legacy UAs.
 /// RFC 2617: set stale=TRUE when re-challenging after a nonce expiry.
-async fn register_send_digest_challenge_stale(
+#[allow(clippy::too_many_arguments)]
+async fn register_send_digest_challenge_with_algorithms(
     socket: &tokio::net::UdpSocket,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
@@ -1166,17 +1915,14 @@ async fn register_send_digest_challenge_stale(
     req: &Request,
     realm: &str,
     stale: bool,
+    algorithms: &[DigestAlgorithm],
 ) -> anyhow::Result<()> {
-    let nonce_sha256 = Uuid::new_v4().simple().to_string();
-    let nonce_md5 = Uuid::new_v4().simple().to_string();
-    let mut stored_nonces: Vec<String> = Vec::new();
-    for nonce in [&nonce_sha256, &nonce_md5] {
-        if let Err(e) = store_register_nonce(redis, nonce, cfg.nonce_ttl_s).await {
-            for prev in &stored_nonces {
-                if let Err(ce) = invalidate_register_nonce(redis, prev).await {
-                    tracing::warn!(%ce, nonce = %prev, "register nonce rollback after store failure");
-                }
-            }
+    let mut stored_nonces = Vec::new();
+    let mut challenges = Vec::new();
+    for algorithm in algorithms {
+        let nonce = Uuid::new_v4().simple().to_string();
+        if let Err(e) = store_register_nonce(redis, &nonce, cfg.nonce_ttl_s).await {
+            rollback_register_challenge_nonces(redis, &stored_nonces).await;
             tracing::warn!(%e, "register nonce store");
             respond(
                 socket,
@@ -1186,18 +1932,36 @@ async fn register_send_digest_challenge_stale(
             .await;
             return Ok(());
         }
-        stored_nonces.push((*nonce).to_owned());
+        challenges.push(register_challenge_header(*algorithm, realm, &nonce, stale));
+        stored_nonces.push(nonce);
     }
-    let challenges = [
-        DigestChallenge::new_sha256(realm, &nonce_sha256)
-            .with_stale(stale)
-            .to_www_authenticate(),
-        DigestChallenge::new_md5(realm, &nonce_md5)
-            .with_stale(stale)
-            .to_www_authenticate(),
-    ];
     respond(socket, peer, &sip_response_multi_www_auth(req, &challenges)).await;
     Ok(())
+}
+
+async fn rollback_register_challenge_nonces(redis: &RedisPool, nonces: &[String]) {
+    for nonce in nonces {
+        if let Err(e) = invalidate_register_nonce(redis, nonce).await {
+            tracing::warn!(%e, %nonce, "register nonce rollback after store failure");
+        }
+    }
+}
+
+fn register_challenge_header(
+    algorithm: DigestAlgorithm,
+    realm: &str,
+    nonce: &str,
+    stale: bool,
+) -> String {
+    match algorithm {
+        DigestAlgorithm::Sha256 => DigestChallenge::new_sha256(realm, nonce),
+        DigestAlgorithm::Md5 => DigestChallenge::new_md5(realm, nonce),
+        DigestAlgorithm::Md5Sess | DigestAlgorithm::Sha256Sess => {
+            unreachable!("REGISTER challenges use non-session algorithms")
+        }
+    }
+    .with_stale(stale)
+    .to_www_authenticate()
 }
 
 fn register_call_id_cseq(req: &Request) -> Option<(&str, u32)> {
@@ -1233,7 +1997,8 @@ async fn register_digest_commit_after_lock(
         Ok(false) => {
             // Nonce expired (TTL elapsed) — re-challenge with stale=TRUE so the UA
             // retries with a fresh nonce without prompting for credentials (RFC 2617 §3.3).
-            register_send_digest_challenge_stale(socket, redis, cfg, peer, req, dom, true).await
+            register_send_digest_challenge(socket, redis, cfg, peer, req, &dr.username, dom, true)
+                .await
         }
         Ok(true) => {
             register_commit_digest(
@@ -1334,6 +2099,18 @@ async fn register_complete_digest(
     commit_res
 }
 
+fn select_register_stored_ha1(
+    credentials: &SipDigestCredentials,
+    algorithm: DigestAlgorithm,
+) -> Option<&str> {
+    match algorithm {
+        DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess => credentials.sip_digest_ha1.as_deref(),
+        DigestAlgorithm::Sha256 | DigestAlgorithm::Sha256Sess => {
+            credentials.sip_digest_ha1_sha256.as_deref()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn register_commit_digest(
     socket: &tokio::net::UdpSocket,
@@ -1349,8 +2126,37 @@ async fn register_commit_digest(
     call_id: &str,
     cseq_n: u32,
 ) -> anyhow::Result<()> {
-    let ha1 = match get_user_sip_digest_ha1(&cfg.pg, &dr.username, dom).await {
-        Ok(h) => h,
+    if !register_digest_verified(socket, redis, cfg, peer, req, dom, dr).await? {
+        return Ok(());
+    }
+    if !register_enforce_digest_nc(socket, redis, cfg, peer, req, dr).await? {
+        return Ok(());
+    }
+    if !register_store_binding(socket, redis, peer, req, dom, user, binding, expires, dr).await? {
+        return Ok(());
+    }
+    if let Err(e) = mark_register_tx_ok(redis, call_id, cseq_n).await {
+        tracing::warn!(%e, "register tx ok marker");
+    }
+    respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+    Ok(())
+}
+
+async fn register_digest_verified(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    dom: &str,
+    dr: &DigestResponse,
+) -> anyhow::Result<bool> {
+    let credentials = match get_user_sip_digest_credentials(&cfg.pg, &dr.username, dom).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            register_missing_selected_ha1(socket, redis, cfg, peer, req, dom, dr, None).await?;
+            return Ok(false);
+        }
         Err(e) => {
             tracing::warn!(%e, "register db");
             respond(
@@ -1359,27 +2165,84 @@ async fn register_commit_digest(
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
-            return Ok(());
+            return Ok(false);
         }
     };
-    let Some(ha1) = ha1 else {
-        tracing::warn!(
-            username = %dr.username,
-            realm = %dr.realm,
-            "REGISTER digest: missing sip_digest_ha1 (migrate DB or POST /api/v1/users)"
-        );
-        if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
-            tracing::warn!(%e, "register invalidate nonce");
-        }
-        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-        return Ok(());
+    let Some(ha1) = select_register_stored_ha1(&credentials, dr.algorithm) else {
+        register_missing_selected_ha1(socket, redis, cfg, peer, req, dom, dr, Some(&credentials))
+            .await?;
+        return Ok(false);
     };
-    let ha1_verify = match effective_stored_ha1_for_digest(dr, &ha1) {
-        Ok(h) => h,
+    let Some(ha1_verify) = register_effective_ha1(socket, peer, req, dr, ha1).await else {
+        return Ok(false);
+    };
+    if verify_digest(dr, &ha1_verify, "REGISTER") {
+        return Ok(true);
+    }
+    invalidate_register_nonce_after_forbid(redis, dr, "register invalidate nonce").await;
+    respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_missing_selected_ha1(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    realm: &str,
+    dr: &DigestResponse,
+    credentials: Option<&SipDigestCredentials>,
+) -> anyhow::Result<()> {
+    tracing::warn!(
+        algorithm = %dr.algorithm.as_str(),
+        username = %dr.username,
+        realm = %dr.realm,
+        "REGISTER digest: missing HA1 for selected digest algorithm"
+    );
+    invalidate_register_nonce_after_forbid(redis, dr, "register invalidate nonce").await;
+    if should_rechallenge_md5_only(credentials, dr.algorithm) {
+        return register_send_digest_challenge_with_algorithms(
+            socket,
+            redis,
+            cfg,
+            peer,
+            req,
+            realm,
+            false,
+            &[DigestAlgorithm::Md5],
+        )
+        .await;
+    }
+    respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+    Ok(())
+}
+
+fn should_rechallenge_md5_only(
+    credentials: Option<&SipDigestCredentials>,
+    algorithm: DigestAlgorithm,
+) -> bool {
+    matches!(
+        algorithm,
+        DigestAlgorithm::Sha256 | DigestAlgorithm::Sha256Sess
+    ) && credentials
+        .is_some_and(|c| c.sip_digest_ha1.is_some() && c.sip_digest_ha1_sha256.is_none())
+}
+
+async fn register_effective_ha1(
+    socket: &tokio::net::UdpSocket,
+    peer: SocketAddr,
+    req: &Request,
+    dr: &DigestResponse,
+    ha1: &str,
+) -> Option<String> {
+    match effective_stored_ha1_for_digest(dr, ha1) {
+        Ok(h) => Some(h),
         Err(EffectiveHa1Error::MissingCnonce) => {
             tracing::warn!(username = %dr.username, "REGISTER digest -sess without cnonce");
             respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-            return Ok(());
+            None
         }
         Err(e) => {
             tracing::warn!(%e, username = %dr.username, "REGISTER digest HA1 derive");
@@ -1389,83 +2252,117 @@ async fn register_commit_digest(
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
-            return Ok(());
+            None
         }
-    };
-    if !verify_digest(dr, &ha1_verify, "REGISTER") {
-        if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
-            tracing::warn!(%e, "register invalidate nonce");
-        }
-        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-        return Ok(());
     }
+}
 
-    // RFC 7616 §3.4: enforce nc strictly increases to prevent replay within a nonce lifetime.
-    if let Some(nc_new) = dr.nc_as_u64() {
-        let nc_key = register_digest_nonce_nc_key(&dr.nonce);
-        let nc_prev: u64 = match redis.get::<Option<String>, _>(&nc_key).await {
-            Ok(Some(s)) => match s.parse::<u64>() {
-                Ok(v) => v,
-                Err(pe) => {
-                    tracing::warn!(
-                        %pe,
-                        %nc_key,
-                        nc_raw = %s,
-                        "register redis nc value is not a decimal u64"
-                    );
-                    respond(
-                        socket,
-                        peer,
-                        &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
-                    )
-                    .await;
-                    return Ok(());
-                }
-            },
-            Ok(None) => 0,
-            Err(e) => {
-                tracing::warn!(%e, "register redis (nc get)");
-                respond(socket, peer, &overload_response(req, 30)).await;
-                return Ok(());
-            }
-        };
-        if let Err(nc_err) = validate_nc(nc_new, nc_prev) {
-            tracing::warn!(?nc_err, nonce = %dr.nonce, "register nc replay");
-            if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
-                tracing::warn!(%e, "register invalidate nonce (nc replay)");
-            }
-            respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
-            return Ok(());
-        }
-        let nc_set: Result<Option<String>, _> = redis
-            .set(
-                &nc_key,
-                nc_new.to_string(),
-                Some(Expiration::EX(cfg.nonce_ttl_s.max(1) as i64)),
-                None,
-                false,
-            )
+async fn invalidate_register_nonce_after_forbid(redis: &RedisPool, dr: &DigestResponse, msg: &str) {
+    if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
+        tracing::warn!(%e, message = %msg, "register invalidate nonce");
+    }
+}
+
+async fn register_enforce_digest_nc(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    dr: &DigestResponse,
+) -> anyhow::Result<bool> {
+    let Some(nc_new) = dr.nc_as_u64() else {
+        return Ok(true);
+    };
+    let nc_key = register_digest_nonce_nc_key(&dr.nonce);
+    let Some(nc_prev) = register_previous_nc(socket, redis, peer, req, &nc_key).await? else {
+        return Ok(false);
+    };
+    if let Err(nc_err) = validate_nc(nc_new, nc_prev) {
+        tracing::warn!(?nc_err, nonce = %dr.nonce, "register nc replay");
+        invalidate_register_nonce_after_forbid(redis, dr, "register invalidate nonce (nc replay)")
             .await;
-        match nc_set {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    %e,
-                    %nc_key,
-                    nc_new,
-                    "register redis (nc set); aborting REGISTER to avoid nc replay window"
-                );
+        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        return Ok(false);
+    }
+    register_store_nc(socket, redis, cfg, peer, req, &nc_key, nc_new).await
+}
+
+async fn register_previous_nc(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    peer: SocketAddr,
+    req: &Request,
+    nc_key: &str,
+) -> anyhow::Result<Option<u64>> {
+    match redis.get::<Option<String>, _>(nc_key).await {
+        Ok(Some(s)) => match s.parse::<u64>() {
+            Ok(v) => Ok(Some(v)),
+            Err(pe) => {
+                tracing::warn!(%pe, %nc_key, nc_raw = %s, "register redis nc value is not a decimal u64");
                 respond(
                     socket,
                     peer,
                     &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
                 )
                 .await;
-                return Ok(());
+                Ok(None)
             }
+        },
+        Ok(None) => Ok(Some(0)),
+        Err(e) => {
+            tracing::warn!(%e, "register redis (nc get)");
+            respond(socket, peer, &overload_response(req, 30)).await;
+            Ok(None)
         }
     }
+}
 
+async fn register_store_nc(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    peer: SocketAddr,
+    req: &Request,
+    nc_key: &str,
+    nc_new: u64,
+) -> anyhow::Result<bool> {
+    let nc_set: Result<Option<String>, _> = redis
+        .set(
+            nc_key,
+            nc_new.to_string(),
+            Some(Expiration::EX(cfg.nonce_ttl_s.max(1) as i64)),
+            None,
+            false,
+        )
+        .await;
+    match nc_set {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            tracing::warn!(%e, %nc_key, nc_new, "register redis (nc set); aborting REGISTER to avoid nc replay window");
+            respond(
+                socket,
+                peer,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            Ok(false)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_store_binding(
+    socket: &tokio::net::UdpSocket,
+    redis: &RedisPool,
+    peer: SocketAddr,
+    req: &Request,
+    dom: &str,
+    user: &str,
+    binding: &ContactBinding,
+    expires: u32,
+    dr: &DigestResponse,
+) -> anyhow::Result<bool> {
     if let Err(e) = upsert_contact(redis, dom, user, binding, expires as i64).await {
         tracing::warn!(%e, "register upsert");
         respond(
@@ -1474,16 +2371,12 @@ async fn register_commit_digest(
             &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
         )
         .await;
-        return Ok(());
+        return Ok(false);
     }
     if let Err(e) = invalidate_register_nonce(redis, &dr.nonce).await {
         tracing::warn!(%e, "register invalidate nonce after upsert");
     }
-    if let Err(e) = mark_register_tx_ok(redis, call_id, cseq_n).await {
-        tracing::warn!(%e, "register tx ok marker");
-    }
-    respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
-    Ok(())
+    Ok(true)
 }
 
 async fn respond(socket: &tokio::net::UdpSocket, peer: SocketAddr, msg: &SipMessage) {
@@ -1615,7 +2508,10 @@ fn simple_ok(req: &Request) -> Response {
 /// Returns user and host part of `sip:user@host` or `sip:user@host:5060` (no angle brackets).
 fn parse_sip_user_host(uri: &str) -> Option<(String, String)> {
     let u = uri.trim();
-    let u = u.strip_prefix("sip:").or_else(|| u.strip_prefix("sips:"))?;
+    let (scheme, u) = u.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("sip") && !scheme.eq_ignore_ascii_case("sips") {
+        return None;
+    }
     let u = u.split(';').next()?.split('?').next()?;
     if u.is_empty() {
         return None;
@@ -1632,16 +2528,90 @@ fn parse_sip_user_host(uri: &str) -> Option<(String, String)> {
     Some((user.to_string(), rest.to_string()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContactTarget {
+    host: String,
+    port: Option<u16>,
+    transport: SipTransport,
+}
+
 async fn resolve_udp_target(contact_uri: &str) -> Option<SocketAddr> {
-    let (_, hostport) = parse_sip_user_host(contact_uri)?;
-    let (host, port) = split_host_port(&hostport)?;
-    resolve_sip_targets(&host, Some(port), SipTransport::Udp)
+    let target = parse_contact_target(contact_uri)?;
+    if target.transport != SipTransport::Udp {
+        return None;
+    }
+    resolve_sip_targets(&target.host, target.port, SipTransport::Udp)
         .await
         .into_iter()
         .next()
         .map(|target| target.addr)
 }
 
+fn parse_contact_target(contact_uri: &str) -> Option<ContactTarget> {
+    let uri = strip_name_addr(contact_uri);
+    let (_, hostport) = parse_sip_user_host(uri)?;
+    let (host, port) = split_host_port_optional(&hostport)?;
+    Some(ContactTarget {
+        host,
+        port,
+        transport: contact_transport(uri)?,
+    })
+}
+
+fn contact_transport(uri: &str) -> Option<SipTransport> {
+    if is_sips_uri(uri) {
+        return Some(SipTransport::Tls);
+    }
+
+    match uri_transport_param(uri) {
+        Some(value) if value.eq_ignore_ascii_case("udp") => Some(SipTransport::Udp),
+        Some(value) if value.eq_ignore_ascii_case("tcp") => Some(SipTransport::Tcp),
+        Some(value) if value.eq_ignore_ascii_case("tls") => Some(SipTransport::Tls),
+        Some(_) => None,
+        None => Some(SipTransport::Udp),
+    }
+}
+
+fn uri_transport_param(uri: &str) -> Option<&str> {
+    uri.split('?')
+        .next()?
+        .split(';')
+        .skip(1)
+        .find_map(transport_param_value)
+}
+
+fn transport_param_value(param: &str) -> Option<&str> {
+    let (name, value) = param.split_once('=')?;
+    name.eq_ignore_ascii_case("transport").then_some(value)
+}
+
+fn split_host_port_optional(rest: &str) -> Option<(String, Option<u16>)> {
+    if let Some(stripped) = rest.strip_prefix('[') {
+        return split_ipv6_host_port(stripped);
+    }
+
+    match rest.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => Some((host.to_string(), Some(port))),
+            Err(_) => Some((rest.to_string(), None)),
+        },
+        None => Some((rest.to_string(), None)),
+    }
+}
+
+fn split_ipv6_host_port(rest: &str) -> Option<(String, Option<u16>)> {
+    let bracket_end = rest.find(']')?;
+    let host = &rest[..bracket_end];
+    let after_bracket = &rest[bracket_end + 1..];
+    let port = match after_bracket.strip_prefix(':') {
+        Some(port) => Some(port.parse::<u16>().ok()?),
+        None if after_bracket.is_empty() => None,
+        None => return None,
+    };
+    Some((host.to_string(), port))
+}
+
+#[cfg(test)]
 fn split_host_port(rest: &str) -> Option<(String, u16)> {
     if let Some(stripped) = rest.strip_prefix('[') {
         let bracket_end = stripped.find(']')?;
@@ -1693,6 +2663,125 @@ mod tests {
     }
 
     #[test]
+    fn sips_policy_rejects_udp_ingress() {
+        let mut req = invite_request();
+        req.uri = "sips:bob@example.com".to_string();
+
+        assert_eq!(
+            enforce_sips_policy(&req, Transport::Udp),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn sips_policy_allows_tls_ingress() {
+        let mut req = invite_request();
+        req.uri = "sips:bob@example.com".to_string();
+
+        assert_eq!(enforce_sips_policy(&req, Transport::Tls), None);
+    }
+
+    #[test]
+    fn sips_downgrade_to_sip_contact_is_unavailable() {
+        let mut req = invite_request();
+        req.uri = "sips:bob@example.com".to_string();
+
+        assert_eq!(
+            sips_downgrade_status(&req, "sip:bob@target.example.com"),
+            Some(StatusCode::TEMPORARILY_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn sips_target_contact_is_not_a_downgrade() {
+        let mut req = invite_request();
+        req.uri = "sips:bob@example.com".to_string();
+
+        assert_eq!(
+            sips_downgrade_status(&req, "sips:bob@target.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn contact_target_uses_tls_for_sips_scheme() {
+        let target = parse_contact_target("sips:bob@example.com").unwrap();
+
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, None);
+        assert_eq!(target.transport, SipTransport::Tls);
+    }
+
+    #[test]
+    fn contact_target_uses_tls_transport_parameter() {
+        let target = parse_contact_target("sip:bob@example.com;transport=tls").unwrap();
+
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, None);
+        assert_eq!(target.transport, SipTransport::Tls);
+    }
+
+    #[test]
+    fn contact_target_uses_tcp_transport_parameter() {
+        let target = parse_contact_target("sip:bob@example.com:5070;transport=tcp").unwrap();
+
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, Some(5070));
+        assert_eq!(target.transport, SipTransport::Tcp);
+    }
+
+    #[tokio::test]
+    async fn udp_target_rejects_sips_contact_with_udp_transport_param() {
+        let target = resolve_udp_target("sips:bob@127.0.0.1;transport=udp").await;
+
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn parse_sip_user_host_accepts_uppercase_sips_scheme() {
+        let parsed = parse_sip_user_host("SIPS:alice@example.com;transport=tls");
+
+        assert_eq!(
+            parsed,
+            Some(("alice".to_string(), "example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn contact_target_rejects_unsupported_transport_parameter() {
+        assert!(parse_contact_target("sip:bob@example.com;transport=sctp").is_none());
+        assert!(parse_contact_target("sip:bob@example.com;transport=typo").is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_target_rejects_sips_contact() {
+        let target = resolve_udp_target("sips:bob@127.0.0.1").await;
+
+        assert_eq!(target, None);
+    }
+
+    #[tokio::test]
+    async fn udp_target_rejects_tls_transport_contact() {
+        let target = resolve_udp_target("sip:bob@127.0.0.1;transport=tls").await;
+
+        assert_eq!(target, None);
+    }
+
+    #[tokio::test]
+    async fn udp_target_rejects_tcp_transport_contact() {
+        let target = resolve_udp_target("sip:bob@127.0.0.1:5070;transport=tcp").await;
+
+        assert_eq!(target, None);
+    }
+
+    #[tokio::test]
+    async fn udp_target_rejects_unsupported_transport_contact() {
+        let target = resolve_udp_target("sip:bob@127.0.0.1;transport=ws").await;
+
+        assert_eq!(target, None);
+    }
+
+    #[test]
     fn split_host_port_strips_ipv6_brackets_with_port() {
         let parsed = split_host_port("[2001:db8::1]:5070");
 
@@ -1736,6 +2825,128 @@ mod tests {
             response_relay_addr(via),
             Some("127.0.0.1:5091".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn register_digest_credential_selection_uses_md5_for_md5_algorithms() {
+        let credentials = sipora_data::pg::SipDigestCredentials {
+            sip_digest_ha1: Some("md5-ha1".to_string()),
+            sip_digest_ha1_sha256: Some("sha256-ha1".to_string()),
+        };
+
+        assert_eq!(
+            select_register_stored_ha1(&credentials, sipora_auth::digest::DigestAlgorithm::Md5),
+            Some("md5-ha1")
+        );
+        assert_eq!(
+            select_register_stored_ha1(&credentials, sipora_auth::digest::DigestAlgorithm::Md5Sess),
+            Some("md5-ha1")
+        );
+    }
+
+    #[test]
+    fn register_digest_credential_selection_uses_sha256_for_sha256_algorithms() {
+        let credentials = sipora_data::pg::SipDigestCredentials {
+            sip_digest_ha1: Some("md5-ha1".to_string()),
+            sip_digest_ha1_sha256: Some("sha256-ha1".to_string()),
+        };
+
+        assert_eq!(
+            select_register_stored_ha1(&credentials, sipora_auth::digest::DigestAlgorithm::Sha256,),
+            Some("sha256-ha1")
+        );
+        assert_eq!(
+            select_register_stored_ha1(
+                &credentials,
+                sipora_auth::digest::DigestAlgorithm::Sha256Sess,
+            ),
+            Some("sha256-ha1")
+        );
+    }
+
+    #[test]
+    fn register_challenge_algorithms_keep_dual_challenge_when_sha256_exists() {
+        let credentials = sipora_data::pg::SipDigestCredentials {
+            sip_digest_ha1: Some("md5-ha1".to_string()),
+            sip_digest_ha1_sha256: Some("sha256-ha1".to_string()),
+        };
+
+        assert_eq!(
+            register_challenge_algorithms(Some(&credentials)),
+            vec![DigestAlgorithm::Sha256, DigestAlgorithm::Md5]
+        );
+    }
+
+    #[test]
+    fn register_challenge_algorithms_use_md5_only_for_md5_only_user() {
+        let credentials = sipora_data::pg::SipDigestCredentials {
+            sip_digest_ha1: Some("md5-ha1".to_string()),
+            sip_digest_ha1_sha256: None,
+        };
+
+        assert_eq!(
+            register_challenge_algorithms(Some(&credentials)),
+            vec![DigestAlgorithm::Md5]
+        );
+    }
+
+    #[test]
+    fn sha256_attempt_for_md5_only_user_rechallenges_with_md5() {
+        let credentials = sipora_data::pg::SipDigestCredentials {
+            sip_digest_ha1: Some("md5-ha1".to_string()),
+            sip_digest_ha1_sha256: None,
+        };
+
+        assert!(should_rechallenge_md5_only(
+            Some(&credentials),
+            DigestAlgorithm::Sha256
+        ));
+        assert!(!should_rechallenge_md5_only(
+            Some(&credentials),
+            DigestAlgorithm::Md5
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_invite_target_selects_later_udp_send_eligible_contact() {
+        let contacts = vec![
+            ContactBinding {
+                uri: "sip:bob@127.0.0.1;transport=tcp".to_string(),
+                q_value: 1.0,
+                expires: 300,
+            },
+            ContactBinding {
+                uri: "sip:bob@127.0.0.1:5097".to_string(),
+                q_value: 0.5,
+                expires: 300,
+            },
+        ];
+
+        let selected = select_initial_invite_target(&invite_request(), contacts).await;
+
+        let InitialInviteTarget::Selected(route) = selected else {
+            panic!("expected later UDP contact to be selected");
+        };
+        assert_eq!(route.target_uri, "sip:bob@127.0.0.1:5097");
+        assert_eq!(route.target, "127.0.0.1:5097".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn initial_invite_target_reports_sips_downgrade_before_udp_filtering() {
+        let mut req = invite_request();
+        req.uri = "sips:bob@example.com".to_string();
+        let contacts = vec![ContactBinding {
+            uri: "sip:bob@127.0.0.1;transport=tcp".to_string(),
+            q_value: 1.0,
+            expires: 300,
+        }];
+
+        let selected = select_initial_invite_target(&req, contacts).await;
+
+        let InitialInviteTarget::Downgrade(status) = selected else {
+            panic!("expected downgrade to be reported before UDP filtering");
+        };
+        assert_eq!(status, StatusCode::TEMPORARILY_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -1809,6 +3020,508 @@ mod tests {
         assert_eq!(table.read().await.len(), 1);
     }
 
+    #[tokio::test]
+    async fn parallel_initial_invite_forwards_all_remaining_targets() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let table = new_forward_table();
+        let transaction_table = new_transaction_table();
+        let fork_table = new_fork_table();
+
+        let cfg = test_cfg();
+        forward_initial_invite(
+            &socket,
+            &table,
+            &transaction_table,
+            &fork_table,
+            &cfg,
+            "127.0.0.1:5090".parse().unwrap(),
+            invite_request(),
+            InitialInviteRoute {
+                target_uri: format!("sip:bob@{first_addr}"),
+                target: first_addr,
+                remaining_targets: vec![format!("sip:bob@{second_addr}")],
+            },
+        )
+        .await
+        .unwrap();
+
+        let first_req = recv_request(&first).await;
+        let second_req = recv_request(&second).await;
+        assert_eq!(first_req.method, Method::Invite);
+        assert_eq!(second_req.method, Method::Invite);
+        assert_eq!(table.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn serial_initial_invite_keeps_remaining_targets_deferred() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let table = new_forward_table();
+        let transaction_table = new_transaction_table();
+        let fork_table = new_fork_table();
+
+        let mut cfg = test_cfg();
+        cfg.fork_parallel = false;
+        forward_initial_invite(
+            &socket,
+            &table,
+            &transaction_table,
+            &fork_table,
+            &cfg,
+            "127.0.0.1:5090".parse().unwrap(),
+            invite_request(),
+            InitialInviteRoute {
+                target_uri: format!("sip:bob@{first_addr}"),
+                target: first_addr,
+                remaining_targets: vec![format!("sip:bob@{second_addr}")],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recv_request(&first).await.method, Method::Invite);
+        assert_no_datagram(&second).await;
+        let pending = table.read().await.values().next().unwrap().clone();
+        assert_eq!(
+            pending.remaining_targets,
+            vec![format!("sip:bob@{second_addr}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_failure_cancels_parallel_sibling_branch() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sibling = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let sibling_addr = sibling.local_addr().unwrap();
+        let table = new_forward_table();
+        let fork_table = new_fork_table();
+        let cfg = test_cfg();
+
+        insert_test_forward(&table, "z9hG4bK-a", client_addr, sibling_addr).await;
+        insert_test_forward(&table, "z9hG4bK-b", client_addr, sibling_addr).await;
+        record_fork_branches(&fork_table, "call-1", vec!["z9hG4bK-a", "z9hG4bK-b"]).await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-a", StatusCode(603)),
+        )
+        .await
+        .unwrap();
+
+        let cancel = recv_request(&sibling).await;
+        assert_eq!(cancel.method, Method::Cancel);
+        assert_eq!(recv_response(&client).await.status, StatusCode(603));
+    }
+
+    #[tokio::test]
+    async fn parallel_failures_are_deferred_until_all_branches_complete() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let fork_table = new_fork_table();
+        let cfg = test_cfg();
+
+        insert_test_forward(&table, "z9hG4bK-a", client_addr, client_addr).await;
+        insert_test_forward(&table, "z9hG4bK-b", client_addr, client_addr).await;
+        record_fork_branches(&fork_table, "call-1", vec!["z9hG4bK-a", "z9hG4bK-b"]).await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-a", StatusCode::NOT_FOUND),
+        )
+        .await
+        .unwrap();
+        assert_no_datagram(&client).await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-b", StatusCode::SERVICE_UNAVAILABLE),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recv_response(&client).await.status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!fork_table.read().await.contains_key("call-1"));
+    }
+
+    #[tokio::test]
+    async fn parallel_success_relays_later_success_from_sibling() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let fork_table = new_fork_table();
+        let cfg = test_cfg();
+
+        insert_test_forward(&table, "z9hG4bK-a", client_addr, client_addr).await;
+        insert_test_forward(&table, "z9hG4bK-b", client_addr, client_addr).await;
+        record_fork_branches(&fork_table, "call-1", vec!["z9hG4bK-a", "z9hG4bK-b"]).await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-a", StatusCode::OK),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recv_response(&client).await.status, StatusCode::OK);
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-b", StatusCode::OK),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recv_response(&client).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancel_success_response_is_consumed_hop_by_hop() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let cfg = test_cfg();
+
+        insert_test_forward(&table, "z9hG4bK-cancel", client_addr, client_addr).await;
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &new_fork_table(),
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response_for_method("z9hG4bK-cancel", StatusCode::OK, Method::Cancel),
+        )
+        .await
+        .unwrap();
+
+        assert_no_datagram(&client).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_global_failure_after_success_is_absorbed() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let fork_table = new_fork_table();
+        let cfg = test_cfg();
+
+        insert_test_forward(&table, "z9hG4bK-a", client_addr, client_addr).await;
+        insert_test_forward(&table, "z9hG4bK-b", client_addr, client_addr).await;
+        record_fork_branches(&fork_table, "call-1", vec!["z9hG4bK-a", "z9hG4bK-b"]).await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-a", StatusCode::OK),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recv_response(&client).await.status, StatusCode::OK);
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-b", StatusCode(603)),
+        )
+        .await
+        .unwrap();
+
+        assert_no_datagram(&client).await;
+        assert!(!fork_table.read().await.contains_key("call-1"));
+    }
+
+    #[tokio::test]
+    async fn fork_cleanup_removes_states_without_live_forward_branches() {
+        let table = new_forward_table();
+        let fork_table = new_fork_table();
+        record_fork_branches(&fork_table, "call-1", vec!["z9hG4bK-a", "z9hG4bK-b"]).await;
+
+        cleanup_stale_fork_states(&fork_table, &table).await;
+
+        assert!(!fork_table.read().await.contains_key("call-1"));
+    }
+
+    #[tokio::test]
+    async fn fork_state_is_removed_after_success_and_all_siblings_complete() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let fork_table = new_fork_table();
+        let cfg = test_cfg();
+
+        insert_test_forward(&table, "z9hG4bK-a", client_addr, client_addr).await;
+        insert_test_forward(&table, "z9hG4bK-b", client_addr, client_addr).await;
+        record_fork_branches(&fork_table, "call-1", vec!["z9hG4bK-a", "z9hG4bK-b"]).await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-a", StatusCode::OK),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recv_response(&client).await.status, StatusCode::OK);
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &fork_table,
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_response("z9hG4bK-b", StatusCode::BUSY_HERE),
+        )
+        .await
+        .unwrap();
+
+        assert_no_datagram(&client).await;
+        assert!(!fork_table.read().await.contains_key("call-1"));
+    }
+
+    #[tokio::test]
+    async fn cancel_request_preserves_route_headers_from_original_invite() {
+        let mut invite = invite_request();
+        let route = "<sip:edge.example.com;lr>".to_string();
+        invite.headers.push(Header::Route(vec![route.clone()]));
+
+        let cancel = build_cancel_request(
+            &invite,
+            "z9hG4bK-proxy",
+            "sip:bob@127.0.0.1:5090",
+            &test_cfg(),
+        );
+
+        assert!(
+            cancel
+                .headers
+                .iter()
+                .any(|h| { matches!(h, Header::Route(routes) if routes == &vec![route.clone()]) })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fork_response_is_relayed_when_remaining_targets_are_unusable() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let cfg = test_cfg();
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy".to_string(),
+            client_addr,
+            "127.0.0.1:5099".parse().unwrap(),
+            vec![client_via()],
+            Some(invite_request()),
+            vec![
+                "sips:bob@127.0.0.1".to_string(),
+                "sip:bob@127.0.0.1;transport=tcp".to_string(),
+                "sip:bob@127.0.0.1;transport=ws".to_string(),
+            ],
+            "sip:bob@127.0.0.1:5099".to_string(),
+        )
+        .await;
+
+        dispatch_response(
+            &socket,
+            &cfg,
+            &table,
+            &new_fork_table(),
+            &crate::dialog::new_dialog_table(),
+            &new_transaction_table(),
+            &crate::dialog::new_refresh_table(),
+            proxy_failure_response(),
+        )
+        .await
+        .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("client should receive original failure")
+        .unwrap();
+        let (_, msg) = parse_sip_message(&buf[..n]).unwrap();
+        let SipMessage::Response(resp) = msg else {
+            panic!("expected response");
+        };
+        assert_eq!(resp.status, StatusCode::BUSY_HERE);
+    }
+
+    async fn insert_test_forward(
+        table: &ForwardTable,
+        branch: &str,
+        client_addr: SocketAddr,
+        target_addr: SocketAddr,
+    ) {
+        insert_forward(
+            table,
+            branch.to_string(),
+            client_addr,
+            target_addr,
+            vec![client_via()],
+            Some(invite_request()),
+            vec![],
+            format!("sip:bob@{target_addr}"),
+        )
+        .await;
+    }
+
+    async fn recv_request(socket: &tokio::net::UdpSocket) -> Request {
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected SIP request")
+        .unwrap();
+        let (_, msg) = parse_sip_message(&buf[..n]).unwrap();
+        let SipMessage::Request(req) = msg else {
+            panic!("expected request");
+        };
+        req
+    }
+
+    async fn recv_response(socket: &tokio::net::UdpSocket) -> Response {
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected SIP response")
+        .unwrap();
+        let (_, msg) = parse_sip_message(&buf[..n]).unwrap();
+        let SipMessage::Response(resp) = msg else {
+            panic!("expected response");
+        };
+        resp
+    }
+
+    async fn assert_no_datagram(socket: &tokio::net::UdpSocket) {
+        let mut buf = vec![0u8; 2048];
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            socket.recv_from(&mut buf),
+        )
+        .await;
+        assert!(recv.is_err(), "unexpected datagram received");
+    }
+
+    fn client_via() -> Via {
+        Via {
+            transport: Transport::Udp,
+            host: "client.example.com".to_string(),
+            port: Some(5060),
+            branch: "z9hG4bK-client".to_string(),
+            received: None,
+            rport: RportParam::Absent,
+            params: vec![],
+        }
+    }
+
+    fn proxy_response(branch: &str, status: StatusCode) -> Response {
+        proxy_response_for_method(branch, status, Method::Invite)
+    }
+
+    fn proxy_response_for_method(branch: &str, status: StatusCode, method: Method) -> Response {
+        let mut req = invite_request();
+        if let Some(cseq) = req.headers.iter_mut().find_map(|h| match h {
+            Header::CSeq(cseq) => Some(cseq),
+            _ => None,
+        }) {
+            cseq.method = method;
+        }
+        let mut resp = match sip_response(&req, status) {
+            SipMessage::Response(resp) => resp,
+            SipMessage::Request(_) => unreachable!("sip_response returns a response"),
+        };
+        resp.headers.insert(
+            0,
+            Header::Via(Via {
+                transport: Transport::Udp,
+                host: "proxy.example.com".to_string(),
+                port: Some(5060),
+                branch: branch.to_string(),
+                received: None,
+                rport: RportParam::Absent,
+                params: vec![],
+            }),
+        );
+        resp
+    }
+
+    fn proxy_failure_response() -> Response {
+        proxy_response("z9hG4bK-proxy", StatusCode::BUSY_HERE)
+    }
+
     fn test_cfg() -> UdpProxyConfig {
         UdpProxyConfig {
             domain: "example.com".to_string(),
@@ -1821,6 +3534,7 @@ mod tests {
                 default_expires: 300,
             },
             nonce_ttl_s: 120,
+            fork_parallel: true,
             pg: PgPoolOptions::new()
                 .connect_lazy("postgres://localhost/sipora")
                 .unwrap(),

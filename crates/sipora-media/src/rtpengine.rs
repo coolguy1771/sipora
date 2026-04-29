@@ -15,6 +15,53 @@ pub struct NgResponse {
     pub error_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcePolicy {
+    Remove,
+    Force,
+    Optional,
+}
+
+impl IcePolicy {
+    pub fn as_ng_str(self) -> &'static str {
+        match self {
+            Self::Remove => "remove",
+            Self::Force => "force",
+            Self::Optional => "optional",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtlsPolicy {
+    Passive,
+    Off,
+}
+
+impl DtlsPolicy {
+    pub fn as_ng_str(self) -> &'static str {
+        match self {
+            Self::Passive => "passive",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtpEnginePolicy {
+    pub ice: IcePolicy,
+    pub dtls: DtlsPolicy,
+}
+
+impl RtpEnginePolicy {
+    pub fn classic_udp() -> Self {
+        Self {
+            ice: IcePolicy::Remove,
+            dtls: DtlsPolicy::Passive,
+        }
+    }
+}
+
 pub struct RtpEngineClient {
     endpoint: SocketAddr,
 }
@@ -29,11 +76,19 @@ impl RtpEngineClient {
     }
 
     pub fn build_offer(call_id: &str, sdp: &str, from_tag: &str) -> NgCommand {
+        Self::build_offer_with_policy(call_id, sdp, from_tag, &RtpEnginePolicy::classic_udp())
+    }
+
+    pub fn build_offer_with_policy(
+        call_id: &str,
+        sdp: &str,
+        from_tag: &str,
+        policy: &RtpEnginePolicy,
+    ) -> NgCommand {
         let mut params = HashMap::new();
         params.insert("sdp".into(), sdp.to_owned());
         params.insert("from-tag".into(), from_tag.to_owned());
-        params.insert("ICE".into(), "remove".into());
-        params.insert("DTLS".into(), "passive".into());
+        apply_policy_params(&mut params, policy);
         NgCommand {
             command: "offer".into(),
             call_id: call_id.to_owned(),
@@ -42,10 +97,27 @@ impl RtpEngineClient {
     }
 
     pub fn build_answer(call_id: &str, sdp: &str, from_tag: &str, to_tag: &str) -> NgCommand {
+        Self::build_answer_with_policy(
+            call_id,
+            sdp,
+            from_tag,
+            to_tag,
+            &RtpEnginePolicy::classic_udp(),
+        )
+    }
+
+    pub fn build_answer_with_policy(
+        call_id: &str,
+        sdp: &str,
+        from_tag: &str,
+        to_tag: &str,
+        policy: &RtpEnginePolicy,
+    ) -> NgCommand {
         let mut params = HashMap::new();
         params.insert("sdp".into(), sdp.to_owned());
         params.insert("from-tag".into(), from_tag.to_owned());
         params.insert("to-tag".into(), to_tag.to_owned());
+        apply_policy_params(&mut params, policy);
         NgCommand {
             command: "answer".into(),
             call_id: call_id.to_owned(),
@@ -99,6 +171,11 @@ impl RtpEngineClient {
     }
 }
 
+fn apply_policy_params(params: &mut HashMap<String, String>, policy: &RtpEnginePolicy) {
+    params.insert("ICE".into(), policy.ice.as_ng_str().into());
+    params.insert("DTLS".into(), policy.dtls.as_ng_str().into());
+}
+
 fn extract_bencode_value(data: &str, key: &str) -> Option<String> {
     let key_encoded = format!("{}:{}", key.len(), key);
     let pos = data.find(&key_encoded)?;
@@ -117,4 +194,40 @@ pub struct MediaStats {
     pub jitter_ms: f64,
     pub packets_sent: u64,
     pub packets_recv: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SDP: &str = "v=0\r\nm=audio 4000 RTP/AVP 0\r\n";
+
+    #[test]
+    fn classic_policy_preserves_offer_ice_and_dtls_params() {
+        let cmd = RtpEngineClient::build_offer("call-1", SDP, "from-1");
+
+        assert_eq!(cmd.params.get("ICE").map(String::as_str), Some("remove"));
+        assert_eq!(cmd.params.get("DTLS").map(String::as_str), Some("passive"));
+    }
+
+    #[test]
+    fn classic_policy_adds_answer_ice_and_dtls_params() {
+        let cmd = RtpEngineClient::build_answer("call-1", SDP, "from-1", "to-1");
+
+        assert_eq!(cmd.params.get("ICE").map(String::as_str), Some("remove"));
+        assert_eq!(cmd.params.get("DTLS").map(String::as_str), Some("passive"));
+    }
+
+    #[test]
+    fn ice_capable_policy_can_keep_candidates_with_passive_dtls() {
+        let policy = RtpEnginePolicy {
+            ice: IcePolicy::Optional,
+            dtls: DtlsPolicy::Passive,
+        };
+
+        let cmd = RtpEngineClient::build_offer_with_policy("call-1", SDP, "from-1", &policy);
+
+        assert_eq!(cmd.params.get("ICE").map(String::as_str), Some("optional"));
+        assert_eq!(cmd.params.get("DTLS").map(String::as_str), Some("passive"));
+    }
 }
