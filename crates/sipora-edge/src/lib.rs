@@ -1,6 +1,7 @@
 pub mod firewall;
 pub mod ratelimit;
 pub mod redis_ratelimit;
+pub mod ws_table;
 
 use thiserror::Error;
 

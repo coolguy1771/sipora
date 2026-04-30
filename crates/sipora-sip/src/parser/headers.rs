@@ -101,7 +101,74 @@ fn match_header(name: &str, value: &[u8]) -> Header {
                 },
             }
         }
+        "path" => Header::Path(split_comma_list(value)),
+        "service-route" => Header::ServiceRoute(split_comma_list(value)),
+        "subscription-state" => parse_subscription_state_line(value),
+        "event" | "o" => Header::Event(trim_str(value)),
+        "sip-etag" => Header::SipEtag(trim_str(value)),
+        "sip-if-match" => Header::SipIfMatch(trim_str(value)),
+        "refer-to" | "r" => Header::ReferTo(trim_str(value)),
+        "referred-by" | "b" => parse_name_addr(value)
+            .map(|(_, na)| Header::ReferredBy(na))
+            .unwrap_or_else(|_| ext(name, value)),
+        "replaces" => parse_replaces_header(trim_str(value)),
         _ => ext(name, value),
+    }
+}
+
+fn parse_subscription_state_line(input: &[u8]) -> Header {
+    let s = trim_str(input);
+    let mut parts = s.split(';');
+    let first = parts.next().unwrap_or("").trim();
+    let state = match first.to_ascii_lowercase().as_str() {
+        "active" => SubscriptionStateValue::Active,
+        "pending" => SubscriptionStateValue::Pending,
+        "terminated" => SubscriptionStateValue::Terminated,
+        _ => {
+            return Header::Extension {
+                name: "Subscription-State".to_owned(),
+                value: s,
+            };
+        }
+    };
+    let mut expires = None;
+    let mut reason = None;
+    for p in parts {
+        let p = p.trim();
+        if let Some((k, v)) = p.split_once('=') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "expires" => expires = v.trim().parse().ok(),
+                "reason" => reason = Some(v.trim().trim_matches('"').to_owned()),
+                _ => {}
+            }
+        }
+    }
+    Header::SubscriptionState {
+        state,
+        expires,
+        reason,
+    }
+}
+
+fn parse_replaces_header(s: String) -> Header {
+    let mut iter = s.split(';');
+    let call_id = iter.next().unwrap_or("").trim().to_owned();
+    let mut from_tag = String::new();
+    let mut to_tag = String::new();
+    for part in iter {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "from-tag" => from_tag = v.trim().to_owned(),
+                "to-tag" => to_tag = v.trim().to_owned(),
+                _ => {}
+            }
+        }
+    }
+    Header::Replaces {
+        call_id,
+        from_tag,
+        to_tag,
     }
 }
 

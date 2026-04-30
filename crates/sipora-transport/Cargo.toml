@@ -20,5 +20,9 @@ futures-util = { workspace = true }
 sipora-sip = { workspace = true }
 sipora-core = { workspace = true }
 hickory-resolver = { workspace = true }
+regex = { workspace = true }
 moka = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

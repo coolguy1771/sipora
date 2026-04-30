@@ -57,12 +57,13 @@ async fn main() -> Result<()> {
     let ocsp_der = load_optional(&config.tls.ocsp_response_der_path)?;
 
     let bind = SocketAddr::from(([0, 0, 0, 0], config.general.sips_port));
+    let shutdown_tcp = shutdown_rx.clone();
     let edge_ctx = listener::EdgeListenContext {
         pool: Arc::clone(&pool),
         rl: rl.clone(),
         rl_cfg: config.rate_limit.clone(),
         firewall: firewall.clone(),
-        shutdown: shutdown_rx,
+        shutdown: shutdown_tcp,
     };
     tokio::spawn(async move {
         if let Err(e) =
@@ -72,8 +73,25 @@ async fn main() -> Result<()> {
         }
     });
 
+    let ws_bind = SocketAddr::from(([0, 0, 0, 0], config.general.wss_port));
+    let ws_table = sipora_edge::ws_table::new_ws_connection_table();
+    let ws_ctx = listener::EdgeListenContext {
+        pool: Arc::clone(&pool),
+        rl: rl.clone(),
+        rl_cfg: config.rate_limit.clone(),
+        firewall: firewall.clone(),
+        shutdown: shutdown_rx,
+    };
+    tokio::spawn(async move {
+        if let Err(e) = listener::run_ws_edge(ws_bind, ws_ctx, ws_table).await {
+            tracing::error!("edge WebSocket listener: {e}");
+        }
+    });
+
     ready.set_ready(true);
-    tracing::info!("sipora-edge listening (SIP on sips_port, health on health_port)");
+    tracing::info!(
+        "sipora-edge listening (SIP on sips_port, WebSocket on wss_port, health on health_port)"
+    );
 
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(true);

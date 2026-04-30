@@ -244,6 +244,14 @@ async fn lookup_records(
         .ok()
 }
 
+/// Raw DNS lookup (ENUM/NAPTR tests and helpers).
+pub async fn dns_lookup(
+    name: &str,
+    record_type: RecordType,
+) -> Option<hickory_resolver::lookup::Lookup> {
+    lookup_records(name, record_type).await
+}
+
 async fn lookup_ip(host: &str) -> Option<hickory_resolver::lookup_ip::LookupIp> {
     timeout(DNS_TIMEOUT, resolver()?.lookup_ip(host))
         .await

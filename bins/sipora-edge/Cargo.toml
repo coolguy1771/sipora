@@ -20,3 +20,4 @@ sipora-core = { workspace = true }
 sipora-sip = { workspace = true }
 sipora-transport = { workspace = true }
 sipora-edge = { workspace = true }
+uuid = { workspace = true }

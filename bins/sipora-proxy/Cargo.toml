@@ -6,17 +6,24 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "sipora_proxy"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sipora-proxy"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sipora-core = { workspace = true }
 sipora-sip = { workspace = true }
 sipora-transport = { workspace = true }
@@ -27,3 +34,9 @@ sipora-edge = { workspace = true }
 fred = { workspace = true }
 sqlx = { workspace = true }
 moka = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }

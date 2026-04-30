@@ -13,3 +13,5 @@ thiserror = { workspace = true }
 fred = { workspace = true }
 sipora-sip = { workspace = true }
 sipora-core = { workspace = true }
+sipora-transport = { workspace = true }
+uuid = { workspace = true }

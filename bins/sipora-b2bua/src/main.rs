@@ -7,9 +7,11 @@ mod udp;
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
+use sipora_core::config::MediaConfig;
 use sipora_core::config::SiporaConfig;
 use sipora_core::health::serve_health;
 use sipora_core::health_ready::AtomicReady;
+use sipora_media::rtpengine::{DtlsPolicy, IcePolicy, RtpEnginePolicy};
 use std::net::SocketAddr;
 use tokio::sync::watch;
 
@@ -58,6 +60,7 @@ async fn main() -> Result<()> {
         advertise,
         sip_port,
         policy: codec::CodecPolicy::new(config.media.allowed_codecs.clone()),
+        rtp_engine_policy: rtp_engine_policy_from_media(&config.media),
         router: routing::ProxyRouter::new(config.proxy.max_forwards),
         stir: build_b2bua_stir(&config.stir)?,
     };
@@ -89,6 +92,19 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     tracing::info!("shutting down");
     Ok(())
+}
+
+fn rtp_engine_policy_from_media(cfg: &MediaConfig) -> RtpEnginePolicy {
+    let ice = match cfg.rtpengine_ice.trim().to_ascii_lowercase().as_str() {
+        "force" => IcePolicy::Force,
+        "optional" => IcePolicy::Optional,
+        _ => IcePolicy::Remove,
+    };
+    let dtls = match cfg.rtpengine_dtls.trim().to_ascii_lowercase().as_str() {
+        "off" => DtlsPolicy::Off,
+        _ => DtlsPolicy::Passive,
+    };
+    RtpEnginePolicy { ice, dtls }
 }
 
 fn build_b2bua_stir(cfg: &sipora_core::config::StirConfig) -> Result<Option<udp::B2buaStirConfig>> {
@@ -179,4 +195,25 @@ async fn try_postgres_cdrs(config: &SiporaConfig, legs: [&cdr::CallDetailRecord;
     }
     tracing::info!("cdr records written to PostgreSQL");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rtp_engine_policy_from_media;
+    use sipora_core::config::MediaConfig;
+    use sipora_media::rtpengine::{IcePolicy, RtpEngineClient};
+
+    #[test]
+    fn rtp_engine_policy_from_media_maps_config_strings() {
+        let m = MediaConfig {
+            rtpengine_ice: "optional".into(),
+            rtpengine_dtls: "off".into(),
+            ..Default::default()
+        };
+        let p = rtp_engine_policy_from_media(&m);
+        assert_eq!(p.ice, IcePolicy::Optional);
+        let cmd = RtpEngineClient::build_offer_with_policy("c", "v=0\r\n", "t", &p);
+        assert_eq!(cmd.params.get("ICE").map(String::as_str), Some("optional"));
+        assert_eq!(cmd.params.get("DTLS").map(String::as_str), Some("off"));
+    }
 }

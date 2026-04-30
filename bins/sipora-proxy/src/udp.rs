@@ -14,17 +14,24 @@ use sipora_core::redis_keys::{
 };
 use sipora_data::pg::{SipDigestCredentials, get_user_sip_digest_credentials};
 use sipora_location::ContactBinding;
-use sipora_location::redis_store::{list_contact_uris, upsert_contact};
+use sipora_location::gruu;
+use sipora_location::presence::{PresenceError, load_presence, publish_presence};
+use sipora_location::redis_store::{list_contact_uris, lookup_user_for_pub_gruu, upsert_contact};
+use sipora_location::subscription::{
+    Subscription, delete_subscription, list_subscriptions_for_aor, next_notify_cseq,
+    save_subscription,
+};
 use sipora_sip::overload::overload_response;
 use sipora_sip::parser::message::parse_sip_message;
 use sipora_sip::serialize::serialize_message;
 use sipora_sip::transaction::TransactionKey;
 use sipora_sip::transaction::manager::{TransactionManager, TransactionType};
-use sipora_sip::types::header::{Header, Transport, Via};
+use sipora_sip::types::header::{ContactValue, Header, SubscriptionStateValue, Transport, Via};
 use sipora_sip::types::message::{Request, Response, SipMessage, SipVersion};
 use sipora_sip::types::method::Method;
 use sipora_sip::types::status::StatusCode;
 use sipora_transport::dns::{SipTransport, resolve_sip_targets};
+use sipora_transport::enum_resolve_tel_to_sip;
 use sipora_transport::udp::UdpTransport;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
@@ -35,14 +42,18 @@ use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 use crate::dialog::{
-    DialogState, DialogTable, RefreshTable, cancel_session_guard, dialog_for_request,
+    DialogKey, DialogState, DialogTable, RefreshTable, cancel_session_guard, dialog_for_request,
     insert_dialog_from_response, new_refresh_table, remove_dialog, spawn_session_guard,
 };
+use crate::event_bodies::{presence_body_from_doc, reginfo_xml};
 use crate::forward_table::{
-    ForwardTable, PendingForward, find_branch_by_call_id, find_branch_by_call_id_and_rseq,
-    find_branches_by_call_id, get_pending_forward, insert_forward, prepare_response,
-    spawn_forward_sweeper,
+    ForwardTable, PendingForward, ResponseTarget, find_branch_by_call_id,
+    find_branch_by_call_id_and_rseq, find_branches_by_call_id, get_pending_forward, insert_forward,
+    prepare_response, spawn_forward_sweeper,
 };
+use crate::ingress::ProxyIngress;
+use crate::message_sender::{MessageSender, MessageTarget};
+use crate::notify::{build_notify_request, dispatch_notify};
 use crate::routing::ProxyRouter;
 
 /// Expiry clamp range for REGISTER.
@@ -94,6 +105,13 @@ pub struct UdpProxyConfig {
     pub fork_parallel: bool,
     pub pg: PgPool,
     pub stir: StirConfig,
+    pub max_message_bytes: usize,
+    pub outbound_edge_uri: Option<String>,
+    pub push_gateway_url: Option<String>,
+    pub push_timeout_ms: u64,
+    pub push_auth_bearer: Option<String>,
+    pub push_device_idle_secs: u64,
+    pub http_client: reqwest::Client,
 }
 
 pub type TransactionTable = Arc<RwLock<TransactionManager>>;
@@ -101,7 +119,7 @@ pub type TransactionTable = Arc<RwLock<TransactionManager>>;
 #[derive(Debug)]
 struct PreparedForkFailure {
     response: Response,
-    target: SocketAddr,
+    target: ResponseTarget,
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +172,145 @@ fn spawn_fork_sweeper(
     })
 }
 
+enum MergeIngress {
+    Ws(crate::proxy_ws::WsIngressEnvelope),
+    Tcp((SocketAddr, SipMessage)),
+}
+
+fn spawn_merge_ingress_bridges(
+    ws_ingress: Option<tokio::sync::mpsc::Receiver<crate::proxy_ws::WsIngressEnvelope>>,
+    tcp_ingress: Option<tokio::sync::mpsc::Receiver<(SocketAddr, SipMessage)>>,
+) -> Option<tokio::sync::mpsc::Receiver<MergeIngress>> {
+    if ws_ingress.is_none() && tcp_ingress.is_none() {
+        return None;
+    }
+    let cap = sipora_edge::ws_table::WS_OUTBOUND_QUEUE;
+    let (tx, rx) = tokio::sync::mpsc::channel(cap);
+    if let Some(mut ws) = ws_ingress {
+        let t = tx.clone();
+        tokio::spawn(async move {
+            while let Some(env) = ws.recv().await {
+                if t.send(MergeIngress::Ws(env)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(mut tcp) = tcp_ingress {
+        let t = tx.clone();
+        tokio::spawn(async move {
+            while let Some(pair) = tcp.recv().await {
+                if t.send(MergeIngress::Tcp(pair)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    Some(rx)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_merge_ingress_item(
+    item: MergeIngress,
+    socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
+    tcp_for_merge: &Option<Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
+    redis: &RedisPool,
+    router: &ProxyRouter,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    dialog_table: &DialogTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    refresh_table: &RefreshTable,
+) -> anyhow::Result<()> {
+    match item {
+        MergeIngress::Ws(env) => {
+            let ingress = ProxyIngress::ws(
+                socket.clone(),
+                sip_sender.clone(),
+                env.connection_id,
+                env.peer,
+            );
+            match env.message {
+                SipMessage::Request(req) => {
+                    dispatch_request(
+                        &ingress,
+                        sip_sender,
+                        redis,
+                        router,
+                        cfg,
+                        forward_table,
+                        dialog_table,
+                        transaction_table,
+                        fork_table,
+                        refresh_table,
+                        tcp_for_merge.as_ref(),
+                        req,
+                    )
+                    .await
+                }
+                SipMessage::Response(resp) => {
+                    dispatch_response(
+                        socket,
+                        sip_sender,
+                        cfg,
+                        forward_table,
+                        fork_table,
+                        dialog_table,
+                        transaction_table,
+                        refresh_table,
+                        resp,
+                    )
+                    .await
+                }
+            }
+        }
+        MergeIngress::Tcp((addr, msg)) => {
+            let Some(pool) = tcp_for_merge else {
+                tracing::warn!(%addr, "tcp ingress without pool");
+                return Ok(());
+            };
+            let ingress = ProxyIngress::tcp_downstream(socket.clone(), pool.clone(), addr);
+            match msg {
+                SipMessage::Request(req) => {
+                    dispatch_request(
+                        &ingress,
+                        sip_sender,
+                        redis,
+                        router,
+                        cfg,
+                        forward_table,
+                        dialog_table,
+                        transaction_table,
+                        fork_table,
+                        refresh_table,
+                        tcp_for_merge.as_ref(),
+                        req,
+                    )
+                    .await
+                }
+                SipMessage::Response(resp) => {
+                    dispatch_response(
+                        socket,
+                        sip_sender,
+                        cfg,
+                        forward_table,
+                        fork_table,
+                        dialog_table,
+                        transaction_table,
+                        refresh_table,
+                        resp,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_udp_proxy(
     addr: SocketAddr,
     redis: RedisPool,
@@ -161,17 +318,36 @@ pub async fn run_udp_proxy(
     forward_table: ForwardTable,
     dialog_table: DialogTable,
     transaction_table: TransactionTable,
+    ws_table: Option<sipora_edge::ws_table::WsConnectionTable>,
+    ws_ingress: Option<tokio::sync::mpsc::Receiver<crate::proxy_ws::WsIngressEnvelope>>,
+    tcp_pool: Option<std::sync::Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
+    tcp_ingress: Option<tokio::sync::mpsc::Receiver<(SocketAddr, SipMessage)>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let udp = UdpTransport::bind(addr).await?;
     let socket = Arc::new(udp.into_inner());
+    let udp_snd = Arc::new(crate::message_sender::UdpSender::new(socket.clone()));
+    let ws_snd = ws_table
+        .clone()
+        .map(|t| Arc::new(crate::message_sender::WsSender::new(t)));
+    let tcp_snd = tcp_pool
+        .clone()
+        .map(|p| Arc::new(crate::message_sender::TcpPoolSender::new(p)));
+    let sip_sender: Arc<dyn MessageSender> = Arc::new(crate::notify::CompositeSender {
+        udp: udp_snd,
+        ws: ws_snd,
+        tcp: tcp_snd,
+    });
+    let tcp_for_merge = tcp_pool.clone();
+    let mut merged_rx = spawn_merge_ingress_bridges(ws_ingress, tcp_ingress);
     let router = ProxyRouter::new(cfg.max_forwards);
     let refresh_table = new_refresh_table();
     let fork_table = new_fork_table();
     let _forward_sweeper = spawn_forward_sweeper(forward_table.clone(), shutdown.clone());
     let _fork_sweeper =
         spawn_fork_sweeper(fork_table.clone(), forward_table.clone(), shutdown.clone());
-    let mut buf = vec![0u8; 65535];
+    let recv_cap = cfg.max_message_bytes.clamp(1024, 65535);
+    let mut buf = vec![0u8; recv_cap];
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -187,8 +363,10 @@ pub async fn run_udp_proxy(
                 };
                 let result = match msg {
                     SipMessage::Request(req) => {
+                        let ingress = ProxyIngress::udp(socket.clone(), peer);
                         dispatch_request(
-                            &socket,
+                            &ingress,
+                            &sip_sender,
                             &redis,
                             &router,
                             &cfg,
@@ -197,7 +375,7 @@ pub async fn run_udp_proxy(
                             &transaction_table,
                             &fork_table,
                             &refresh_table,
-                            peer,
+                            tcp_for_merge.as_ref(),
                             req,
                         )
                         .await
@@ -205,6 +383,7 @@ pub async fn run_udp_proxy(
                     SipMessage::Response(resp) => {
                         dispatch_response(
                             &socket,
+                            &sip_sender,
                             &cfg,
                             &forward_table,
                             &fork_table,
@@ -220,13 +399,40 @@ pub async fn run_udp_proxy(
                     tracing::warn!(%peer, "udp proxy: {e}");
                 }
             }
+            merge_item = async {
+                merged_rx.as_mut().expect("merge branch only if Some").recv().await
+            }, if merged_rx.is_some() => {
+                let Some(item) = merge_item else {
+                    merged_rx = None;
+                    continue;
+                };
+                let result = dispatch_merge_ingress_item(
+                    item,
+                    &socket,
+                    &sip_sender,
+                    &tcp_for_merge,
+                    &redis,
+                    &router,
+                    &cfg,
+                    &forward_table,
+                    &dialog_table,
+                    &transaction_table,
+                    &fork_table,
+                    &refresh_table,
+                )
+                .await;
+                if let Err(e) = result {
+                    tracing::warn!("merged ingress: {e}");
+                }
+            }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     redis: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
@@ -235,59 +441,84 @@ async fn dispatch_request(
     transaction_table: &TransactionTable,
     fork_table: &ForkTable,
     refresh_table: &RefreshTable,
-    peer: SocketAddr,
+    tcp_for_merge: Option<&Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
     mut req: Request,
 ) -> anyhow::Result<()> {
-    apply_rfc3581(&mut req, peer);
-    if let Some(status) = enforce_sips_policy(&req, Transport::Udp) {
-        respond(socket, peer, &sip_response(&req, status)).await;
+    apply_rfc3581(&mut req, ingress.source);
+    if let Some(status) = enforce_sips_policy(&req, ingress.ingress_transport()) {
+        crate::ingress::respond(ingress, &sip_response(&req, status)).await;
         return Ok(());
     }
     track_server_transaction(transaction_table, &req).await;
     match req.method {
         Method::Invite => {
             handle_invite(
-                socket,
+                ingress,
                 redis,
                 router,
                 cfg,
                 forward_table,
                 transaction_table,
                 fork_table,
-                peer,
+                dialog_table,
                 req,
             )
             .await
         }
-        Method::Register => handle_register(socket, redis, cfg, peer, req).await,
-        Method::Ack | Method::Bye | Method::Update => {
+        Method::Register => {
+            handle_register(
+                ingress,
+                sip_sender,
+                redis,
+                router,
+                cfg,
+                forward_table,
+                transaction_table,
+                fork_table,
+                dialog_table,
+                tcp_for_merge,
+                req,
+            )
+            .await
+        }
+        Method::Ack | Method::Bye | Method::Update | Method::Refer => {
             handle_dialog_request(
-                socket,
+                ingress,
+                redis,
                 cfg,
                 forward_table,
                 transaction_table,
                 dialog_table,
                 refresh_table,
-                peer,
                 req,
             )
             .await
         }
-        Method::Cancel => {
-            handle_cancel(socket, cfg, forward_table, transaction_table, peer, req).await
-        }
-        Method::Prack => handle_prack(socket, cfg, forward_table, peer, req).await,
+        Method::Cancel => handle_cancel(ingress, cfg, forward_table, transaction_table, req).await,
+        Method::Prack => handle_prack(ingress, cfg, forward_table, req).await,
         Method::Options => {
-            respond(socket, peer, &sip_options_ok(&req)).await;
+            crate::ingress::respond(ingress, &sip_options_ok(&req)).await;
             Ok(())
         }
-        _ => {
-            respond(
-                socket,
-                peer,
-                &sip_response(&req, StatusCode::NOT_IMPLEMENTED),
+        Method::Message => handle_message(ingress, sip_sender, redis, cfg, req).await,
+        Method::Subscribe => handle_subscribe(ingress, sip_sender, redis, cfg, req).await,
+        Method::Notify => {
+            handle_notify(
+                ingress,
+                redis,
+                cfg,
+                forward_table,
+                transaction_table,
+                dialog_table,
+                refresh_table,
+                req,
             )
-            .await;
+            .await
+        }
+        Method::Publish => handle_publish(ingress, sip_sender, redis, cfg, req).await,
+        _ => {
+            crate::ingress::respond(ingress, &sip_response(&req, StatusCode::NOT_IMPLEMENTED))
+                .await;
             Ok(())
         }
     }
@@ -364,6 +595,7 @@ fn top_via_mut(headers: &mut [Header]) -> Option<&mut Via> {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_response(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     fork_table: &ForkTable,
@@ -384,6 +616,7 @@ async fn dispatch_response(
     if is_parallel_branch(fork_table, &resp, &branch).await {
         return handle_parallel_response(
             socket,
+            sip_sender,
             cfg,
             forward_table,
             fork_table,
@@ -403,6 +636,7 @@ async fn dispatch_response(
         };
         return handle_fork_failure_response(
             socket,
+            sip_sender,
             cfg,
             forward_table,
             transaction_table,
@@ -415,6 +649,7 @@ async fn dispatch_response(
 
     relay_final_response(
         socket,
+        sip_sender,
         dialog_table,
         refresh_table,
         forward_table,
@@ -447,6 +682,7 @@ async fn is_parallel_branch(fork_table: &ForkTable, resp: &Response, branch: &st
 #[allow(clippy::too_many_arguments)]
 async fn handle_parallel_response(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     fork_table: &ForkTable,
@@ -460,6 +696,7 @@ async fn handle_parallel_response(
     if resp.status.is_provisional() {
         return relay_parallel_response(
             socket,
+            sip_sender,
             dialog_table,
             refresh_table,
             forward_table,
@@ -473,6 +710,7 @@ async fn handle_parallel_response(
         mark_parallel_success(fork_table, &resp, &branch).await;
         return relay_parallel_response(
             socket,
+            sip_sender,
             dialog_table,
             refresh_table,
             forward_table,
@@ -499,6 +737,7 @@ async fn handle_parallel_response(
         .await?;
         return relay_parallel_response(
             socket,
+            sip_sender,
             dialog_table,
             refresh_table,
             forward_table,
@@ -508,12 +747,13 @@ async fn handle_parallel_response(
         )
         .await;
     }
-    handle_parallel_failure(socket, forward_table, fork_table, &branch, resp).await
+    handle_parallel_failure(socket, sip_sender, forward_table, fork_table, &branch, resp).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn relay_parallel_response(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     dialog_table: &DialogTable,
     refresh_table: &RefreshTable,
     forward_table: &ForwardTable,
@@ -523,6 +763,7 @@ async fn relay_parallel_response(
 ) -> anyhow::Result<()> {
     relay_final_response(
         socket,
+        sip_sender,
         dialog_table,
         refresh_table,
         forward_table,
@@ -654,6 +895,7 @@ async fn cancel_parallel_sibling(
 
 async fn handle_parallel_failure(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     forward_table: &ForwardTable,
     fork_table: &ForkTable,
     branch: &str,
@@ -667,7 +909,7 @@ async fn handle_parallel_failure(
     };
     let final_failure = record_parallel_failure(fork_table, &call_id, branch, resp, target).await;
     if let Some(failure) = final_failure {
-        return send_response(socket, failure.response, failure.target).await;
+        return send_response_target(socket, sip_sender, failure.response, failure.target).await;
     }
     Ok(())
 }
@@ -676,10 +918,13 @@ async fn prepare_parallel_failure(
     forward_table: &ForwardTable,
     branch: &str,
     resp: &mut Response,
-) -> Option<SocketAddr> {
+) -> Option<ResponseTarget> {
     let mut target = prepare_response(forward_table, branch, resp).await?;
     if let Some(via) = response_top_via(resp) {
-        target = response_relay_addr(via).unwrap_or(target);
+        target = match target {
+            ResponseTarget::Udp(a) => ResponseTarget::Udp(response_relay_addr(via).unwrap_or(a)),
+            w @ ResponseTarget::Ws { .. } => w,
+        };
     }
     Some(target)
 }
@@ -689,7 +934,7 @@ async fn record_parallel_failure(
     call_id: &str,
     branch: &str,
     resp: Response,
-    target: SocketAddr,
+    target: ResponseTarget,
 ) -> Option<PreparedForkFailure> {
     let mut table = fork_table.write().await;
     let state = table.get_mut(call_id)?;
@@ -745,6 +990,7 @@ fn failure_status_rank(status: StatusCode) -> u8 {
 #[allow(clippy::too_many_arguments)]
 async fn handle_fork_failure_response(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
@@ -759,13 +1005,18 @@ async fn handle_fork_failure_response(
         return Ok(());
     }
     if let Some(via) = response_top_via(&resp) {
-        target = response_relay_addr(via).unwrap_or(target);
+        target = match target {
+            ResponseTarget::Udp(a) => ResponseTarget::Udp(response_relay_addr(via).unwrap_or(a)),
+            w @ ResponseTarget::Ws { .. } => w,
+        };
     }
-    send_response(socket, resp, target).await
+    send_response_target(socket, sip_sender, resp, target).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_final_response(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     dialog_table: &DialogTable,
     refresh_table: &RefreshTable,
     forward_table: &ForwardTable,
@@ -778,7 +1029,10 @@ async fn relay_final_response(
         return Ok(());
     };
     if let Some(via) = response_top_via(&resp) {
-        target = response_relay_addr(via).unwrap_or(target);
+        target = match target {
+            ResponseTarget::Udp(a) => ResponseTarget::Udp(response_relay_addr(via).unwrap_or(a)),
+            w @ ResponseTarget::Ws { .. } => w,
+        };
     }
     if success_response && let Some(pending) = pending {
         let session_expires = response_session_expires(&resp);
@@ -795,7 +1049,7 @@ async fn relay_final_response(
             spawn_session_guard(dialog_table, refresh_table, dialog_key, se).await;
         }
     }
-    send_response(socket, resp, target).await
+    send_response_target(socket, sip_sender, resp, target).await
 }
 
 fn response_session_expires(resp: &Response) -> Option<u32> {
@@ -813,6 +1067,25 @@ async fn send_response(
     let bytes = serialize_message(&SipMessage::Response(resp));
     socket.send_to(&bytes, target).await?;
     Ok(())
+}
+
+async fn send_response_target(
+    socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
+    resp: Response,
+    target: ResponseTarget,
+) -> anyhow::Result<()> {
+    match target {
+        ResponseTarget::Udp(a) => send_response(socket, resp, a).await,
+        ResponseTarget::Ws { connection_id } => {
+            sip_sender
+                .send_sip(
+                    &MessageTarget::Ws { connection_id },
+                    SipMessage::Response(resp),
+                )
+                .await
+        }
+    }
 }
 
 fn should_try_next_fork(resp: &Response, pending: Option<&PendingForward>) -> bool {
@@ -854,6 +1127,8 @@ async fn forward_next_fork(
             remaining,
             &cfg.advertise,
             cfg.sip_port,
+            &[],
+            pending.reply_ws_conn_id.clone(),
         )
         .await?;
         return Ok(true);
@@ -883,20 +1158,19 @@ fn response_relay_addr(via: &Via) -> Option<SocketAddr> {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_dialog_request(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
+    redis: &RedisPool,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     dialog_table: &DialogTable,
     refresh_table: &RefreshTable,
-    peer: SocketAddr,
     mut req: Request,
 ) -> anyhow::Result<()> {
     let Some((dialog_key, state)) = dialog_for_request(dialog_table, &req).await else {
         if req.method != Method::Ack {
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
             )
             .await;
@@ -912,23 +1186,36 @@ async fn handle_dialog_request(
     );
     let target_uri = dialog_target_uri(&mut req, &state, cfg);
     let Some(target) = resolve_udp_target(&target_uri).await else {
-        respond(socket, peer, &overload_response(&req, 30)).await;
+        crate::ingress::respond(ingress, &overload_response(&req, 30)).await;
         return Ok(());
     };
     let method = req.method.clone();
+    let refer_meta = if method == Method::Refer {
+        refer_state_from_request(&req)
+    } else {
+        None
+    };
     forward_dialog_request(
-        socket,
+        ingress.socket.as_ref(),
         forward_table,
         transaction_table,
-        peer,
+        ingress.source,
         req,
         target_uri,
         target,
         cfg,
     )
     .await?;
+    if let Some(st) = refer_meta {
+        let cid = st.referrer_call_id.clone();
+        if let Err(e) = crate::refer_state::save_refer_state(redis, &cid, &st).await {
+            tracing::warn!(%e, "refer state save");
+        }
+    }
     if method == Method::Bye {
+        let cid = dialog_key.call_id.clone();
         cancel_session_guard(refresh_table, &dialog_key).await;
+        let _ = crate::refer_state::delete_refer_state(redis, &cid).await;
         remove_dialog(dialog_table, &dialog_key);
     }
     Ok(())
@@ -972,6 +1259,128 @@ fn strip_name_addr(uri: &str) -> &str {
     uri.trim().trim_start_matches('<').trim_end_matches('>')
 }
 
+fn dialog_key_from_replaces_header(req: &Request) -> Option<DialogKey> {
+    req.headers.iter().find_map(|h| match h {
+        Header::Replaces {
+            call_id,
+            from_tag,
+            to_tag,
+        } => Some(DialogKey {
+            call_id: call_id.clone(),
+            from_tag: from_tag.clone(),
+            to_tag: to_tag.clone(),
+        }),
+        _ => None,
+    })
+}
+
+fn invite_callee_aor_for_replaces(cfg: &UdpProxyConfig, req: &Request) -> (String, String) {
+    let uri = req.uri.trim();
+    if let Some((u, d)) = parse_sip_user_host(uri) {
+        (u, normalize_domain(d, &cfg.domain))
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+fn refer_state_from_request(req: &Request) -> Option<crate::refer_state::ReferState> {
+    let cid = req.call_id()?.to_string();
+    let refer_to = req.headers.iter().find_map(|h| match h {
+        Header::ReferTo(v) => Some(v.clone()),
+        _ => None,
+    })?;
+    let cseq = req.cseq().map(|c| c.seq).unwrap_or(0);
+    Some(crate::refer_state::ReferState {
+        referrer_call_id: cid,
+        referee_contact: refer_to,
+        event_id: Uuid::new_v4().simple().to_string(),
+        cseq,
+        version: 1,
+    })
+}
+
+fn notify_is_refer_terminated(req: &Request) -> bool {
+    let refer_pkg = req.headers.iter().find_map(|h| match h {
+        Header::Event(ev) => Some(ev.as_str()),
+        _ => None,
+    });
+    let Some(ev) = refer_pkg else {
+        return false;
+    };
+    let ev_lc = ev.to_ascii_lowercase();
+    if !ev_lc.starts_with("refer") {
+        return false;
+    }
+    req.headers.iter().any(|h| match h {
+        Header::SubscriptionState { state, .. } => {
+            matches!(*state, SubscriptionStateValue::Terminated)
+        }
+        _ => false,
+    })
+}
+
+fn notify_event_package_is_refer(req: &Request) -> bool {
+    let Some(ev) = req.headers.iter().find_map(|h| match h {
+        Header::Event(e) => Some(e.as_str()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    ev.to_ascii_lowercase().starts_with("refer")
+}
+
+pub(crate) fn notify_refer_event_id_from_header(ev: &str) -> Option<String> {
+    for part in ev.split(';').skip(1) {
+        let p = part.trim();
+        let mut sp = p.splitn(2, '=');
+        let k = sp.next()?.trim();
+        let v = sp.next()?.trim();
+        if k.eq_ignore_ascii_case("id") {
+            return Some(v.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn notify_refer_event_matches_state(req: &Request, st: &crate::refer_state::ReferState) -> bool {
+    let Some(ev) = req.headers.iter().find_map(|h| match h {
+        Header::Event(e) => Some(e.as_str()),
+        _ => None,
+    }) else {
+        return true;
+    };
+    match notify_refer_event_id_from_header(ev) {
+        Some(id) => id == st.event_id,
+        None => true,
+    }
+}
+
+fn notify_has_sipfrag_content_type(req: &Request) -> bool {
+    req.headers.iter().any(|h| match h {
+        Header::ContentType(ct) => ct.to_ascii_lowercase().contains("message/sipfrag"),
+        _ => false,
+    })
+}
+
+async fn correlate_refer_notify_with_redis(redis: &RedisPool, call_id: &str, req: &Request) {
+    match crate::refer_state::load_refer_state(redis, call_id).await {
+        Ok(Some(st)) => {
+            if !notify_refer_event_matches_state(req, &st) {
+                tracing::warn!(
+                    call_id = %call_id,
+                    expected_event_id = %st.event_id,
+                    "NOTIFY refer Event id mismatch vs ReferState"
+                );
+            }
+            if notify_has_sipfrag_content_type(req) && !req.body.is_empty() {
+                tracing::trace!(call_id = %call_id, sipfrag_bytes = req.body.len(), "refer NOTIFY sipfrag");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(%e, call_id = %call_id, "refer state load"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_dialog_request(
     socket: &tokio::net::UdpSocket,
@@ -992,6 +1401,7 @@ async fn forward_dialog_request(
             forward_table,
             branch,
             peer,
+            None,
             target,
             vias,
             None,
@@ -1007,36 +1417,68 @@ async fn forward_dialog_request(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_invite(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
     pool: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     fork_table: &ForkTable,
-    peer: SocketAddr,
+    dialog_table: &DialogTable,
     req: Request,
 ) -> anyhow::Result<()> {
-    let Some(req) = prepare_invite_ingress(socket, cfg, peer, req).await? else {
+    let Some(req) = prepare_invite_ingress(ingress, cfg, req).await? else {
         return Ok(());
     };
-    if reject_invite_for_max_forwards(socket, router, peer, &req).await {
+    if reject_invite_for_max_forwards(ingress, router, &req).await {
         return Ok(());
     }
-    let Some(contacts) = lookup_invite_contacts(socket, pool, cfg, peer, &req).await? else {
+    if let Some(rep_key) = dialog_key_from_replaces_header(&req)
+        && let Some(state) = dialog_table.get(&rep_key)
+    {
+        let target_uri = strip_name_addr(&state.remote_target).to_string();
+        if let Some(target) = resolve_udp_target(&target_uri).await {
+            let (callee_user, callee_domain) = invite_callee_aor_for_replaces(cfg, &req);
+            let route = InitialInviteRoute {
+                target_uri,
+                target,
+                remaining_targets: vec![],
+                path: state.route_set.clone(),
+                push_contact: None,
+                callee_user,
+                callee_domain,
+            };
+            return forward_initial_invite(
+                ingress,
+                Some(pool),
+                forward_table,
+                transaction_table,
+                fork_table,
+                cfg,
+                req,
+                route,
+            )
+            .await;
+        }
+    }
+    let Some((contacts, callee_user, callee_domain)) =
+        lookup_invite_contacts(ingress, pool, cfg, &req).await?
+    else {
         return Ok(());
     };
-    let Some(route) = select_invite_route(socket, peer, &req, contacts).await else {
+    let Some(route) =
+        select_invite_route(ingress, &req, contacts, callee_user, callee_domain).await
+    else {
         return Ok(());
     };
 
     forward_initial_invite(
-        socket,
+        ingress,
+        Some(pool),
         forward_table,
         transaction_table,
         fork_table,
         cfg,
-        peer,
         req,
         route,
     )
@@ -1044,44 +1486,41 @@ async fn handle_invite(
 }
 
 async fn prepare_invite_ingress(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<Option<Request>> {
     // RFC 3261 §17.2.1: send 100 Trying immediately on INVITE receipt
-    respond(socket, peer, &sip_response(&req, StatusCode::TRYING)).await;
+    crate::ingress::respond(ingress, &sip_response(&req, StatusCode::TRYING)).await;
 
     let mut req = req;
     // RFC 3325 §9.1: strip P-AI/P-PI from untrusted ingress before routing.
-    let trusted = is_trusted_peer(peer, &cfg.stir);
+    let trusted = is_trusted_peer(ingress.source, &cfg.stir);
     strip_untrusted_identity_headers(&mut req, trusted);
     // RFC 8224: verify or require STIR Identity header per configured policy.
     if let Some(reject_code) = check_stir_identity(&mut req, &cfg.stir).await {
-        respond(socket, peer, &sip_response(&req, reject_code)).await;
+        crate::ingress::respond(ingress, &sip_response(&req, reject_code)).await;
         return Ok(None);
     }
 
     // RFC 4028 §8: reject if Session-Expires is below proxy minimum
     if check_session_expires(&req).is_some() {
-        respond(socket, peer, &sip_response_with_min_se(&req, PROXY_MIN_SE)).await;
+        crate::ingress::respond(ingress, &sip_response_with_min_se(&req, PROXY_MIN_SE)).await;
         return Ok(None);
     }
     Ok(Some(req))
 }
 
 async fn reject_invite_for_max_forwards(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
     router: &ProxyRouter,
-    peer: SocketAddr,
     req: &Request,
 ) -> bool {
     if router.check_max_forwards(req).is_none() {
         return false;
     }
-    respond(
-        socket,
-        peer,
+    crate::ingress::respond(
+        ingress,
         &SipMessage::Response(ProxyRouter::too_many_hops_response(req)),
     )
     .await;
@@ -1089,29 +1528,74 @@ async fn reject_invite_for_max_forwards(
 }
 
 async fn lookup_invite_contacts(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
     pool: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
-) -> anyhow::Result<Option<Vec<ContactBinding>>> {
-    let Some((user, dom)) = parse_sip_user_host(&req.uri) else {
-        respond(
-            socket,
-            peer,
+) -> anyhow::Result<Option<(Vec<ContactBinding>, String, String)>> {
+    let uri = req.uri.trim();
+    let (user, dom) = if uri.to_ascii_lowercase().starts_with("tel:") {
+        let digits: String = uri.chars().filter(|c| c.is_ascii_digit()).collect();
+        let Some(sip_uri) = enum_resolve_tel_to_sip(&digits).await else {
+            crate::ingress::respond(
+                ingress,
+                &SipMessage::Response(ProxyRouter::not_found_response(req)),
+            )
+            .await;
+            return Ok(None);
+        };
+        let Some((u, d)) = parse_sip_user_host(&sip_uri) else {
+            crate::ingress::respond(ingress, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+            return Ok(None);
+        };
+        (u, normalize_domain(d, &cfg.domain))
+    } else if let Some(tok) = gruu::gr_token_from_uri(uri) {
+        let Some((_, d_raw)) = parse_sip_user_host(uri) else {
+            crate::ingress::respond(
+                ingress,
+                &SipMessage::Response(ProxyRouter::not_found_response(req)),
+            )
+            .await;
+            return Ok(None);
+        };
+        let dom = normalize_domain(d_raw, &cfg.domain);
+        match lookup_user_for_pub_gruu(pool, &dom, tok).await {
+            Ok(Some(real_user)) => (real_user, dom),
+            Ok(None) => {
+                crate::ingress::respond(
+                    ingress,
+                    &SipMessage::Response(ProxyRouter::not_found_response(req)),
+                )
+                .await;
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(%e, "pub-gruu lookup");
+                crate::ingress::respond(
+                    ingress,
+                    &SipMessage::Response(ProxyRouter::service_unavailable(req, 30)),
+                )
+                .await;
+                return Ok(None);
+            }
+        }
+    } else if let Some((u, d)) = parse_sip_user_host(uri) {
+        (u, normalize_domain(d, &cfg.domain))
+    } else {
+        crate::ingress::respond(
+            ingress,
             &SipMessage::Response(ProxyRouter::not_found_response(req)),
         )
         .await;
         return Ok(None);
     };
-    let dom = normalize_domain(dom, &cfg.domain);
+
     let contacts = match list_contact_uris(pool, &dom, &user).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(%e, "location lookup");
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &SipMessage::Response(ProxyRouter::service_unavailable(req, 30)),
             )
             .await;
@@ -1119,33 +1603,32 @@ async fn lookup_invite_contacts(
         }
     };
     if contacts.is_empty() {
-        respond(
-            socket,
-            peer,
+        crate::ingress::respond(
+            ingress,
             &SipMessage::Response(ProxyRouter::not_found_response(req)),
         )
         .await;
         return Ok(None);
     }
-    Ok(Some(contacts))
+    Ok(Some((contacts, user, dom)))
 }
 
 async fn select_invite_route(
-    socket: &Arc<tokio::net::UdpSocket>,
-    peer: SocketAddr,
+    ingress: &ProxyIngress,
     req: &Request,
     contacts: Vec<ContactBinding>,
+    callee_user: String,
+    callee_domain: String,
 ) -> Option<InitialInviteRoute> {
-    match select_initial_invite_target(req, contacts).await {
+    match select_initial_invite_target(req, contacts, callee_user, callee_domain).await {
         InitialInviteTarget::Selected(route) => Some(route),
         InitialInviteTarget::Downgrade(status) => {
-            respond(socket, peer, &sip_response(req, status)).await;
+            crate::ingress::respond(ingress, &sip_response(req, status)).await;
             None
         }
         InitialInviteTarget::Unusable => {
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &SipMessage::Response(ProxyRouter::service_unavailable(req, 30)),
             )
             .await;
@@ -1154,24 +1637,96 @@ async fn select_invite_route(
     }
 }
 
+async fn maybe_push_wake_for_idle_contact(
+    ingress: &ProxyIngress,
+    pool: &RedisPool,
+    cfg: &UdpProxyConfig,
+    req: &Request,
+    contact: &ContactBinding,
+    callee_user: &str,
+    callee_domain: &str,
+) {
+    let Some(url) = cfg.push_gateway_url.as_deref() else {
+        return;
+    };
+    if contact.pn_provider.as_deref().unwrap_or("").is_empty()
+        && contact.pn_prid.as_deref().unwrap_or("").is_empty()
+    {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let idle = contact
+        .last_register_unix
+        .map(|t| now.saturating_sub(t) > cfg.push_device_idle_secs)
+        .unwrap_or(true);
+    if !idle {
+        return;
+    }
+    let Some(cid) = req.call_id() else {
+        return;
+    };
+    let invite_bytes = serialize_message(&SipMessage::Request(req.clone()));
+    let reply = crate::push::pending_reply_from_ingress(ingress);
+    if let Err(e) = crate::push::stash_pending_invite(
+        pool,
+        cid,
+        &invite_bytes,
+        &reply,
+        callee_domain,
+        callee_user,
+    )
+    .await
+    {
+        tracing::warn!(%e, "push stash invite");
+    }
+    let timeout = Duration::from_millis(cfg.push_timeout_ms.max(1));
+    if let Err(e) = crate::push::wake_device(
+        &cfg.http_client,
+        url,
+        timeout,
+        cfg.push_auth_bearer.as_deref(),
+        contact,
+        cid,
+    )
+    .await
+    {
+        tracing::warn!(%e, "push wake_device");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_initial_invite(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
+    pool: Option<&RedisPool>,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     fork_table: &ForkTable,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: Request,
     route: InitialInviteRoute,
 ) -> anyhow::Result<()> {
+    if let (Some(pool), Some(c)) = (pool, route.push_contact.as_ref()) {
+        maybe_push_wake_for_idle_contact(
+            ingress,
+            pool,
+            cfg,
+            &req,
+            c,
+            &route.callee_user,
+            &route.callee_domain,
+        )
+        .await;
+    }
     if !cfg.fork_parallel {
         let original_request = req.clone();
         forward_invite_request(
-            socket,
+            &ingress.socket,
             forward_table,
             transaction_table,
-            peer,
+            ingress.source,
             req,
             route.target_uri,
             route.target,
@@ -1179,18 +1734,19 @@ async fn forward_initial_invite(
             route.remaining_targets,
             &cfg.advertise,
             cfg.sip_port,
+            &route.path,
+            None,
         )
         .await?;
         return Ok(());
     }
 
     forward_parallel_initial_invite(
-        socket,
+        ingress,
         forward_table,
         transaction_table,
         fork_table,
         cfg,
-        peer,
         req,
         route,
     )
@@ -1199,12 +1755,11 @@ async fn forward_initial_invite(
 
 #[allow(clippy::too_many_arguments)]
 async fn forward_parallel_initial_invite(
-    socket: &Arc<tokio::net::UdpSocket>,
+    ingress: &ProxyIngress,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     fork_table: &ForkTable,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: Request,
     route: InitialInviteRoute,
 ) -> anyhow::Result<()> {
@@ -1212,10 +1767,10 @@ async fn forward_parallel_initial_invite(
     let original_request = req.clone();
     let mut branches = Vec::new();
     let first_branch = forward_invite_request(
-        socket,
+        &ingress.socket,
         forward_table,
         transaction_table,
-        peer,
+        ingress.source,
         req,
         route.target_uri,
         route.target,
@@ -1223,6 +1778,8 @@ async fn forward_parallel_initial_invite(
         vec![],
         &cfg.advertise,
         cfg.sip_port,
+        &route.path,
+        None,
     )
     .await?;
     branches.push(first_branch);
@@ -1230,10 +1787,10 @@ async fn forward_parallel_initial_invite(
     for target_uri in route.remaining_targets {
         if let Some(target) = resolve_udp_target(&target_uri).await {
             let branch = forward_invite_request(
-                socket,
+                &ingress.socket,
                 forward_table,
                 transaction_table,
-                peer,
+                ingress.source,
                 original_request.clone(),
                 target_uri,
                 target,
@@ -1241,6 +1798,8 @@ async fn forward_parallel_initial_invite(
                 vec![],
                 &cfg.advertise,
                 cfg.sip_port,
+                &[],
+                None,
             )
             .await?;
             branches.push(branch);
@@ -1264,6 +1823,7 @@ where
     fork_table.write().await.insert(call_id.to_string(), state);
 }
 
+#[allow(clippy::large_enum_variant)]
 enum InitialInviteTarget {
     Selected(InitialInviteRoute),
     Downgrade(StatusCode),
@@ -1274,11 +1834,19 @@ struct InitialInviteRoute {
     target_uri: String,
     target: SocketAddr,
     remaining_targets: Vec<String>,
+    /// Outbound Path (RFC 3327) as Route headers toward the UA.
+    path: Vec<String>,
+    /// First contact chosen for INVITE (push wake when idle).
+    push_contact: Option<ContactBinding>,
+    callee_user: String,
+    callee_domain: String,
 }
 
 async fn select_initial_invite_target(
     req: &Request,
     mut contacts: Vec<ContactBinding>,
+    callee_user: String,
+    callee_domain: String,
 ) -> InitialInviteTarget {
     contacts.sort_by(|a, b| {
         b.q_value
@@ -1302,6 +1870,10 @@ async fn select_initial_invite_target(
             target_uri: contact.uri.clone(),
             target,
             remaining_targets,
+            path: contact.path.clone(),
+            push_contact: Some(contact.clone()),
+            callee_user,
+            callee_domain,
         });
     }
 
@@ -1321,16 +1893,22 @@ async fn forward_invite_request(
     remaining_targets: Vec<String>,
     advertise: &str,
     sip_port: u16,
+    path_route: &[String],
+    reply_ws_conn_id: Option<String>,
 ) -> anyhow::Result<String> {
     req.uri = target_uri;
     let branch = format!("z9hG4bK{}", Uuid::new_v4().as_simple());
     let original_via_stack = insert_forwarding_headers(&mut req, &branch, advertise, sip_port);
+    if !path_route.is_empty() {
+        req.headers.insert(1, Header::Route(path_route.to_vec()));
+    }
     let tx_key = TransactionKey::from_request(&req);
 
     insert_forward(
         forward_table,
         branch.clone(),
         peer,
+        reply_ws_conn_id,
         target,
         original_via_stack,
         original_request,
@@ -1568,6 +2146,32 @@ fn sip_options_ok(req: &Request) -> SipMessage {
     })
 }
 
+/// Build a 407 with multiple Proxy-Authenticate headers (RFC 8760 dual-algorithm challenge).
+fn sip_response_multi_proxy_auth(req: &Request, challenges: &[String]) -> SipMessage {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            _ => {}
+        }
+    }
+    for ch in challenges {
+        headers.push(Header::ProxyAuthenticate(ch.clone()));
+    }
+    headers.push(Header::ContentLength(0));
+    SipMessage::Response(Response {
+        version: SipVersion::V2_0,
+        status: StatusCode::PROXY_AUTH_REQUIRED,
+        reason: StatusCode::PROXY_AUTH_REQUIRED.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
 /// Build a 401 with multiple WWW-Authenticate headers (RFC 8760 dual-algorithm challenge).
 fn sip_response_multi_www_auth(req: &Request, challenges: &[String]) -> SipMessage {
     let mut headers = Vec::new();
@@ -1666,14 +2270,13 @@ fn sip_response_with_min_se(req: &Request, min_se: u32) -> SipMessage {
 
 /// RFC 3262 §3: route PRACK by `RAck` + Call-ID when possible, else Call-ID only.
 async fn handle_prack(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
-    peer: SocketAddr,
     mut req: Request,
 ) -> anyhow::Result<()> {
     let Some(call_id) = req.call_id() else {
-        respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
     let branch = match prack_rack_tuple(&req) {
@@ -1686,22 +2289,35 @@ async fn handle_prack(
         None => find_branch_by_call_id(forward_table, call_id).await,
     };
     let Some(branch) = branch else {
-        respond(
-            socket,
-            peer,
+        crate::ingress::respond(
+            ingress,
             &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
         )
         .await;
         return Ok(());
     };
+    if let Some(tuple) = prack_rack_tuple(&req) {
+        let mut table = forward_table.write().await;
+        let Some(pending) = table.get_mut(&branch) else {
+            crate::ingress::respond(
+                ingress,
+                &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
+            )
+            .await;
+            return Ok(());
+        };
+        if pending.last_prack_rack == Some(tuple) {
+            return Ok(());
+        }
+        pending.last_prack_rack = Some(tuple);
+    }
     let target_addr = {
         let table = forward_table.read().await;
         table.get(&branch).map(|p| p.target_addr)
     };
     let Some(target) = target_addr else {
-        respond(
-            socket,
-            peer,
+        crate::ingress::respond(
+            ingress,
             &sip_response(&req, StatusCode::CALL_DOES_NOT_EXIST),
         )
         .await;
@@ -1714,7 +2330,7 @@ async fn handle_prack(
     }
     prepend_proxy_via(&mut req, &cfg.advertise, cfg.sip_port);
     let bytes = serialize_message(&SipMessage::Request(req));
-    socket.send_to(&bytes, target).await?;
+    ingress.socket.send_to(&bytes, target).await?;
     Ok(())
 }
 
@@ -1726,15 +2342,14 @@ fn prack_rack_tuple(req: &Request) -> Option<(u32, u32)> {
 }
 
 async fn handle_cancel(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
-    peer: SocketAddr,
     req: Request,
 ) -> anyhow::Result<()> {
     // RFC 3261 §16.10: respond 200 OK immediately, then forward CANCEL downstream.
-    respond(socket, peer, &sip_response(&req, StatusCode::OK)).await;
+    crate::ingress::respond(ingress, &sip_response(&req, StatusCode::OK)).await;
     let Some(call_id) = req.call_id() else {
         return Ok(());
     };
@@ -1758,7 +2373,7 @@ async fn handle_cancel(
         track_client_transaction(transaction_table, &cancel, TransactionType::ClientNonInvite)
             .await;
         let bytes = serialize_message(&SipMessage::Request(cancel));
-        socket.send_to(&bytes, target_addr).await?;
+        ingress.socket.send_to(&bytes, target_addr).await?;
     }
     Ok(())
 }
@@ -1804,21 +2419,84 @@ fn build_cancel_request(
     }
 }
 
-async fn handle_register(
-    socket: &tokio::net::UdpSocket,
+#[allow(clippy::too_many_arguments)]
+async fn replay_push_pending_invites_after_register(
+    socket: Arc<tokio::net::UdpSocket>,
+    sip_sender: Arc<dyn MessageSender>,
+    tcp_for_merge: Option<Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
     redis: &RedisPool,
+    router: &ProxyRouter,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    dialog_table: &DialogTable,
+    dom: &str,
+    user: &str,
+) {
+    let drained = match crate::push::drain_pending_invite_replays(redis, dom, user).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%e, "push pending drain");
+            return;
+        }
+    };
+    for (bytes, reply) in drained {
+        let Some(ing) = crate::push::replay_ingress_from_spec(
+            socket.clone(),
+            sip_sender.clone(),
+            tcp_for_merge.clone(),
+            &reply,
+        ) else {
+            tracing::warn!("push replay: bad ingress spec");
+            continue;
+        };
+        let Ok((_, msg)) = parse_sip_message(&bytes) else {
+            tracing::warn!("push replay: parse");
+            continue;
+        };
+        let SipMessage::Request(inv) = msg else {
+            continue;
+        };
+        if let Err(e) = handle_invite(
+            &ing,
+            redis,
+            router,
+            cfg,
+            forward_table,
+            transaction_table,
+            fork_table,
+            dialog_table,
+            inv,
+        )
+        .await
+        {
+            tracing::warn!(%e, "push replay handle_invite");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_register(
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    router: &ProxyRouter,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    dialog_table: &DialogTable,
+    tcp_for_merge: Option<&Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
     req: Request,
 ) -> anyhow::Result<()> {
     let Some(to) = req.to_header() else {
-        respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
     let Some((user, dom_raw)) = parse_sip_user_host(&to.uri) else {
-        respond(
-            socket,
-            peer,
+        crate::ingress::respond(
+            ingress,
             &SipMessage::Response(ProxyRouter::not_found_response(&req)),
         )
         .await;
@@ -1827,7 +2505,7 @@ async fn handle_register(
     let dom = normalize_domain(dom_raw, &cfg.domain);
     let contacts = req.contacts();
     let Some(contact) = contacts.first() else {
-        respond(socket, peer, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
     let reg = &cfg.registrar;
@@ -1835,19 +2513,28 @@ async fn handle_register(
         .expires()
         .unwrap_or(reg.default_expires)
         .clamp(reg.min_expires, reg.max_expires);
-    let binding = ContactBinding {
-        uri: contact.uri.clone(),
-        q_value: contact.q_value(),
-        expires,
-    };
+    let binding = binding_from_register(contact, &req, &dom, &user, expires);
 
     match register_authorization_value(&req) {
-        None => {
-            register_send_digest_challenge(socket, redis, cfg, peer, &req, &user, &dom, false).await
-        }
+        None => register_send_digest_challenge(ingress, redis, cfg, &req, &user, &dom, false).await,
         Some(auth_raw) => {
             register_complete_digest(
-                socket, redis, cfg, peer, &req, &user, &dom, &binding, expires, auth_raw,
+                ingress,
+                sip_sender,
+                redis,
+                router,
+                cfg,
+                forward_table,
+                transaction_table,
+                fork_table,
+                dialog_table,
+                tcp_for_merge,
+                &req,
+                &user,
+                &dom,
+                &binding,
+                expires,
+                auth_raw,
             )
             .await
         }
@@ -1856,10 +2543,9 @@ async fn handle_register(
 
 #[allow(clippy::too_many_arguments)]
 async fn register_send_digest_challenge(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
     user: &str,
     realm: &str,
@@ -1869,9 +2555,8 @@ async fn register_send_digest_challenge(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(%e, "register db");
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
@@ -1880,10 +2565,9 @@ async fn register_send_digest_challenge(
     };
     let algorithms = register_challenge_algorithms(credentials.as_ref());
     register_send_digest_challenge_with_algorithms(
-        socket,
+        ingress,
         redis,
         cfg,
-        peer,
         req,
         realm,
         stale,
@@ -1908,10 +2592,9 @@ fn register_challenge_algorithms(
 /// RFC 2617: set stale=TRUE when re-challenging after a nonce expiry.
 #[allow(clippy::too_many_arguments)]
 async fn register_send_digest_challenge_with_algorithms(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
     realm: &str,
     stale: bool,
@@ -1924,9 +2607,8 @@ async fn register_send_digest_challenge_with_algorithms(
         if let Err(e) = store_register_nonce(redis, &nonce, cfg.nonce_ttl_s).await {
             rollback_register_challenge_nonces(redis, &stored_nonces).await;
             tracing::warn!(%e, "register nonce store");
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
@@ -1935,8 +2617,74 @@ async fn register_send_digest_challenge_with_algorithms(
         challenges.push(register_challenge_header(*algorithm, realm, &nonce, stale));
         stored_nonces.push(nonce);
     }
-    respond(socket, peer, &sip_response_multi_www_auth(req, &challenges)).await;
+    crate::ingress::respond(ingress, &sip_response_multi_www_auth(req, &challenges)).await;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn message_send_digest_challenge_with_algorithms(
+    ingress: &ProxyIngress,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    req: &Request,
+    realm: &str,
+    stale: bool,
+    algorithms: &[DigestAlgorithm],
+) -> anyhow::Result<()> {
+    let mut stored_nonces = Vec::new();
+    let mut challenges = Vec::new();
+    for algorithm in algorithms {
+        let nonce = Uuid::new_v4().simple().to_string();
+        if let Err(e) = store_register_nonce(redis, &nonce, cfg.nonce_ttl_s).await {
+            rollback_register_challenge_nonces(redis, &stored_nonces).await;
+            tracing::warn!(%e, "message nonce store");
+            crate::ingress::respond(
+                ingress,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+        challenges.push(register_challenge_header(*algorithm, realm, &nonce, stale));
+        stored_nonces.push(nonce);
+    }
+    crate::ingress::respond(ingress, &sip_response_multi_proxy_auth(req, &challenges)).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn message_send_digest_challenge(
+    ingress: &ProxyIngress,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    req: &Request,
+    user: &str,
+    realm: &str,
+    stale: bool,
+) -> anyhow::Result<()> {
+    let credentials = match get_user_sip_digest_credentials(&cfg.pg, user, realm).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(%e, "message db");
+            crate::ingress::respond(
+                ingress,
+                &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let algorithms = register_challenge_algorithms(credentials.as_ref());
+    message_send_digest_challenge_with_algorithms(
+        ingress,
+        redis,
+        cfg,
+        req,
+        realm,
+        stale,
+        &algorithms,
+    )
+    .await
 }
 
 async fn rollback_register_challenge_nonces(redis: &RedisPool, nonces: &[String]) {
@@ -1972,10 +2720,16 @@ fn register_call_id_cseq(req: &Request) -> Option<(&str, u32)> {
 
 #[allow(clippy::too_many_arguments)]
 async fn register_digest_commit_after_lock(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     redis: &RedisPool,
+    router: &ProxyRouter,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    dialog_table: &DialogTable,
+    tcp_for_merge: Option<&Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
     req: &Request,
     user: &str,
     dom: &str,
@@ -1986,29 +2740,45 @@ async fn register_digest_commit_after_lock(
     cseq_n: u32,
 ) -> anyhow::Result<()> {
     let Some(dr) = DigestResponse::parse(auth_raw) else {
-        respond(socket, peer, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+        crate::ingress::respond(ingress, &sip_response(req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
     if !dr.username.eq_ignore_ascii_case(user) || !dr.realm.eq_ignore_ascii_case(dom) {
-        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        crate::ingress::respond(ingress, &sip_response(req, StatusCode::FORBIDDEN)).await;
         return Ok(());
     }
     match register_nonce_exists(redis, &dr.nonce).await {
         Ok(false) => {
             // Nonce expired (TTL elapsed) — re-challenge with stale=TRUE so the UA
             // retries with a fresh nonce without prompting for credentials (RFC 2617 §3.3).
-            register_send_digest_challenge(socket, redis, cfg, peer, req, &dr.username, dom, true)
-                .await
+            register_send_digest_challenge(ingress, redis, cfg, req, &dr.username, dom, true).await
         }
         Ok(true) => {
             register_commit_digest(
-                socket, redis, cfg, peer, req, dom, user, binding, expires, &dr, call_id, cseq_n,
+                ingress,
+                sip_sender,
+                redis,
+                router,
+                cfg,
+                forward_table,
+                transaction_table,
+                fork_table,
+                dialog_table,
+                tcp_for_merge,
+                req,
+                dom,
+                user,
+                binding,
+                expires,
+                &dr,
+                call_id,
+                cseq_n,
             )
             .await
         }
         Err(e) => {
             tracing::warn!(%e, "register redis (nonce exists)");
-            respond(socket, peer, &overload_response(req, 30)).await;
+            crate::ingress::respond(ingress, &overload_response(req, 30)).await;
             Ok(())
         }
     }
@@ -2017,22 +2787,21 @@ async fn register_digest_commit_after_lock(
 /// `Ok(None)` if the request was fully answered (idempotent 200 or 503).
 /// `Ok(Some((lock_key, token)))` if the caller holds the commit lock (release with CAS del).
 async fn register_try_acquire_commit_lock(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
-    peer: SocketAddr,
     req: &Request,
     call_id: &str,
     cseq_n: u32,
 ) -> anyhow::Result<Option<(String, String)>> {
     match register_tx_ok_exists(redis, call_id, cseq_n).await {
         Ok(true) => {
-            respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+            crate::ingress::respond(ingress, &SipMessage::Response(simple_ok(req))).await;
             return Ok(None);
         }
         Ok(false) => {}
         Err(e) => {
             tracing::warn!(%e, "register redis (tx ok exists)");
-            respond(socket, peer, &overload_response(req, 30)).await;
+            crate::ingress::respond(ingress, &overload_response(req, 30)).await;
             return Ok(None);
         }
     }
@@ -2043,22 +2812,22 @@ async fn register_try_acquire_commit_lock(
         Ok(None) => {
             match register_tx_ok_exists(redis, call_id, cseq_n).await {
                 Ok(true) => {
-                    respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+                    crate::ingress::respond(ingress, &SipMessage::Response(simple_ok(req))).await;
                 }
                 Ok(false) => {
                     tracing::warn!("register redis (tx ok false after lock miss; commit pending)");
-                    respond(socket, peer, &overload_response(req, 30)).await;
+                    crate::ingress::respond(ingress, &overload_response(req, 30)).await;
                 }
                 Err(e) => {
                     tracing::warn!(%e, "register redis (tx ok after lock miss)");
-                    respond(socket, peer, &overload_response(req, 30)).await;
+                    crate::ingress::respond(ingress, &overload_response(req, 30)).await;
                 }
             }
             return Ok(None);
         }
         Err(e) => {
             tracing::warn!(%e, "register redis (commit lock)");
-            respond(socket, peer, &overload_response(req, 30)).await;
+            crate::ingress::respond(ingress, &overload_response(req, 30)).await;
             return Ok(None);
         }
     };
@@ -2068,10 +2837,16 @@ async fn register_try_acquire_commit_lock(
 
 #[allow(clippy::too_many_arguments)] // REGISTER digest + binding; refactor into a ctx struct if extended.
 async fn register_complete_digest(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     redis: &RedisPool,
+    router: &ProxyRouter,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    dialog_table: &DialogTable,
+    tcp_for_merge: Option<&Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
     req: &Request,
     user: &str,
     dom: &str,
@@ -2080,18 +2855,35 @@ async fn register_complete_digest(
     auth_raw: &str,
 ) -> anyhow::Result<()> {
     let Some((call_id, cseq_n)) = register_call_id_cseq(req) else {
-        respond(socket, peer, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+        crate::ingress::respond(ingress, &sip_response(req, StatusCode::BAD_REQUEST)).await;
         return Ok(());
     };
 
     let (lock_key, lock_token) =
-        match register_try_acquire_commit_lock(socket, redis, peer, req, call_id, cseq_n).await? {
+        match register_try_acquire_commit_lock(ingress, redis, req, call_id, cseq_n).await? {
             Some(pair) => pair,
             None => return Ok(()),
         };
 
     let commit_res = register_digest_commit_after_lock(
-        socket, redis, cfg, peer, req, user, dom, binding, expires, auth_raw, call_id, cseq_n,
+        ingress,
+        sip_sender,
+        redis,
+        router,
+        cfg,
+        forward_table,
+        transaction_table,
+        fork_table,
+        dialog_table,
+        tcp_for_merge,
+        req,
+        user,
+        dom,
+        binding,
+        expires,
+        auth_raw,
+        call_id,
+        cseq_n,
     )
     .await;
 
@@ -2113,10 +2905,16 @@ fn select_register_stored_ha1(
 
 #[allow(clippy::too_many_arguments)]
 async fn register_commit_digest(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     redis: &RedisPool,
+    router: &ProxyRouter,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    fork_table: &ForkTable,
+    dialog_table: &DialogTable,
+    tcp_for_merge: Option<&Arc<sipora_transport::tcp_pool::TcpConnectionPool>>,
     req: &Request,
     dom: &str,
     user: &str,
@@ -2126,42 +2924,79 @@ async fn register_commit_digest(
     call_id: &str,
     cseq_n: u32,
 ) -> anyhow::Result<()> {
-    if !register_digest_verified(socket, redis, cfg, peer, req, dom, dr).await? {
+    if !register_digest_verified(ingress, redis, cfg, req, dom, dr, "REGISTER").await? {
         return Ok(());
     }
-    if !register_enforce_digest_nc(socket, redis, cfg, peer, req, dr).await? {
+    if !register_enforce_digest_nc(ingress, redis, cfg, req, dr).await? {
         return Ok(());
     }
-    if !register_store_binding(socket, redis, peer, req, dom, user, binding, expires, dr).await? {
+    let mut store_binding = binding.clone();
+    store_binding.last_register_unix = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    if !register_store_binding(ingress, redis, req, dom, user, &store_binding, expires, dr).await? {
         return Ok(());
     }
     if let Err(e) = mark_register_tx_ok(redis, call_id, cseq_n).await {
         tracing::warn!(%e, "register tx ok marker");
     }
-    respond(socket, peer, &SipMessage::Response(simple_ok(req))).await;
+    let contacts_h = req.contacts();
+    let Some(contact_in) = contacts_h.first() else {
+        crate::ingress::respond(ingress, &sip_response(req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    crate::ingress::respond(
+        ingress,
+        &SipMessage::Response(register_success_response(
+            req,
+            contact_in,
+            &store_binding,
+            expires,
+            cfg,
+        )),
+    )
+    .await;
+    replay_push_pending_invites_after_register(
+        ingress.socket.clone(),
+        sip_sender.clone(),
+        tcp_for_merge.cloned(),
+        redis,
+        router,
+        cfg,
+        forward_table,
+        transaction_table,
+        fork_table,
+        dialog_table,
+        dom,
+        user,
+    )
+    .await;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_digest_verified(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
     dom: &str,
     dr: &DigestResponse,
+    sip_method: &str,
 ) -> anyhow::Result<bool> {
     let credentials = match get_user_sip_digest_credentials(&cfg.pg, &dr.username, dom).await {
         Ok(Some(c)) => c,
         Ok(None) => {
-            register_missing_selected_ha1(socket, redis, cfg, peer, req, dom, dr, None).await?;
+            register_missing_selected_ha1(ingress, redis, cfg, req, dom, dr, None).await?;
             return Ok(false);
         }
         Err(e) => {
             tracing::warn!(%e, "register db");
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
@@ -2169,27 +3004,26 @@ async fn register_digest_verified(
         }
     };
     let Some(ha1) = select_register_stored_ha1(&credentials, dr.algorithm) else {
-        register_missing_selected_ha1(socket, redis, cfg, peer, req, dom, dr, Some(&credentials))
+        register_missing_selected_ha1(ingress, redis, cfg, req, dom, dr, Some(&credentials))
             .await?;
         return Ok(false);
     };
-    let Some(ha1_verify) = register_effective_ha1(socket, peer, req, dr, ha1).await else {
+    let Some(ha1_verify) = register_effective_ha1(ingress, req, dr, ha1).await else {
         return Ok(false);
     };
-    if verify_digest(dr, &ha1_verify, "REGISTER") {
+    if verify_digest(dr, &ha1_verify, sip_method) {
         return Ok(true);
     }
     invalidate_register_nonce_after_forbid(redis, dr, "register invalidate nonce").await;
-    respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+    crate::ingress::respond(ingress, &sip_response(req, StatusCode::FORBIDDEN)).await;
     Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn register_missing_selected_ha1(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
     realm: &str,
     dr: &DigestResponse,
@@ -2204,10 +3038,9 @@ async fn register_missing_selected_ha1(
     invalidate_register_nonce_after_forbid(redis, dr, "register invalidate nonce").await;
     if should_rechallenge_md5_only(credentials, dr.algorithm) {
         return register_send_digest_challenge_with_algorithms(
-            socket,
+            ingress,
             redis,
             cfg,
-            peer,
             req,
             realm,
             false,
@@ -2215,7 +3048,7 @@ async fn register_missing_selected_ha1(
         )
         .await;
     }
-    respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+    crate::ingress::respond(ingress, &sip_response(req, StatusCode::FORBIDDEN)).await;
     Ok(())
 }
 
@@ -2231,8 +3064,7 @@ fn should_rechallenge_md5_only(
 }
 
 async fn register_effective_ha1(
-    socket: &tokio::net::UdpSocket,
-    peer: SocketAddr,
+    ingress: &ProxyIngress,
     req: &Request,
     dr: &DigestResponse,
     ha1: &str,
@@ -2241,14 +3073,13 @@ async fn register_effective_ha1(
         Ok(h) => Some(h),
         Err(EffectiveHa1Error::MissingCnonce) => {
             tracing::warn!(username = %dr.username, "REGISTER digest -sess without cnonce");
-            respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+            crate::ingress::respond(ingress, &sip_response(req, StatusCode::FORBIDDEN)).await;
             None
         }
         Err(e) => {
             tracing::warn!(%e, username = %dr.username, "REGISTER digest HA1 derive");
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
@@ -2264,10 +3095,9 @@ async fn invalidate_register_nonce_after_forbid(redis: &RedisPool, dr: &DigestRe
 }
 
 async fn register_enforce_digest_nc(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
     dr: &DigestResponse,
 ) -> anyhow::Result<bool> {
@@ -2275,23 +3105,22 @@ async fn register_enforce_digest_nc(
         return Ok(true);
     };
     let nc_key = register_digest_nonce_nc_key(&dr.nonce);
-    let Some(nc_prev) = register_previous_nc(socket, redis, peer, req, &nc_key).await? else {
+    let Some(nc_prev) = register_previous_nc(ingress, redis, req, &nc_key).await? else {
         return Ok(false);
     };
     if let Err(nc_err) = validate_nc(nc_new, nc_prev) {
         tracing::warn!(?nc_err, nonce = %dr.nonce, "register nc replay");
         invalidate_register_nonce_after_forbid(redis, dr, "register invalidate nonce (nc replay)")
             .await;
-        respond(socket, peer, &sip_response(req, StatusCode::FORBIDDEN)).await;
+        crate::ingress::respond(ingress, &sip_response(req, StatusCode::FORBIDDEN)).await;
         return Ok(false);
     }
-    register_store_nc(socket, redis, cfg, peer, req, &nc_key, nc_new).await
+    register_store_nc(ingress, redis, cfg, req, &nc_key, nc_new).await
 }
 
 async fn register_previous_nc(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
-    peer: SocketAddr,
     req: &Request,
     nc_key: &str,
 ) -> anyhow::Result<Option<u64>> {
@@ -2300,9 +3129,8 @@ async fn register_previous_nc(
             Ok(v) => Ok(Some(v)),
             Err(pe) => {
                 tracing::warn!(%pe, %nc_key, nc_raw = %s, "register redis nc value is not a decimal u64");
-                respond(
-                    socket,
-                    peer,
+                crate::ingress::respond(
+                    ingress,
                     &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
                 )
                 .await;
@@ -2312,17 +3140,16 @@ async fn register_previous_nc(
         Ok(None) => Ok(Some(0)),
         Err(e) => {
             tracing::warn!(%e, "register redis (nc get)");
-            respond(socket, peer, &overload_response(req, 30)).await;
+            crate::ingress::respond(ingress, &overload_response(req, 30)).await;
             Ok(None)
         }
     }
 }
 
 async fn register_store_nc(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
     cfg: &UdpProxyConfig,
-    peer: SocketAddr,
     req: &Request,
     nc_key: &str,
     nc_new: u64,
@@ -2340,9 +3167,8 @@ async fn register_store_nc(
         Ok(_) => Ok(true),
         Err(e) => {
             tracing::warn!(%e, %nc_key, nc_new, "register redis (nc set); aborting REGISTER to avoid nc replay window");
-            respond(
-                socket,
-                peer,
+            crate::ingress::respond(
+                ingress,
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
             )
             .await;
@@ -2353,9 +3179,8 @@ async fn register_store_nc(
 
 #[allow(clippy::too_many_arguments)]
 async fn register_store_binding(
-    socket: &tokio::net::UdpSocket,
+    ingress: &ProxyIngress,
     redis: &RedisPool,
-    peer: SocketAddr,
     req: &Request,
     dom: &str,
     user: &str,
@@ -2365,9 +3190,8 @@ async fn register_store_binding(
 ) -> anyhow::Result<bool> {
     if let Err(e) = upsert_contact(redis, dom, user, binding, expires as i64).await {
         tracing::warn!(%e, "register upsert");
-        respond(
-            socket,
-            peer,
+        crate::ingress::respond(
+            ingress,
             &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
         )
         .await;
@@ -2377,10 +3201,6 @@ async fn register_store_binding(
         tracing::warn!(%e, "register invalidate nonce after upsert");
     }
     Ok(true)
-}
-
-async fn respond(socket: &tokio::net::UdpSocket, peer: SocketAddr, msg: &SipMessage) {
-    let _ = socket.send_to(&serialize_message(msg), peer).await;
 }
 
 // ── STIR/SHAKEN helpers (RFC 8224) ──────────────────────────────────────────
@@ -2482,6 +3302,615 @@ fn sip_response(req: &Request, status: StatusCode) -> SipMessage {
     })
 }
 
+fn sip_response_expires(req: &Request, status: StatusCode, expires: u32) -> SipMessage {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            _ => {}
+        }
+    }
+    headers.push(Header::Expires(expires));
+    headers.push(Header::ContentLength(0));
+    SipMessage::Response(Response {
+        version: SipVersion::V2_0,
+        status,
+        reason: status.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
+fn sip_ok_sip_etag(req: &Request, etag: String) -> SipMessage {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            _ => {}
+        }
+    }
+    headers.push(Header::SipEtag(etag));
+    headers.push(Header::ContentLength(0));
+    SipMessage::Response(Response {
+        version: SipVersion::V2_0,
+        status: StatusCode::OK,
+        reason: StatusCode::OK.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
+fn header_content_type(req: &Request) -> Option<String> {
+    req.headers.iter().find_map(|h| match h {
+        Header::ContentType(c) => Some(c.clone()),
+        _ => None,
+    })
+}
+
+fn header_sip_if_match(req: &Request) -> Option<String> {
+    req.headers.iter().find_map(|h| match h {
+        Header::SipIfMatch(s) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+fn header_event_package(req: &Request) -> String {
+    req.headers
+        .iter()
+        .find_map(|h| match h {
+            Header::Event(e) => Some(e.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "presence".to_string())
+}
+
+fn collect_route_set(req: &Request) -> Vec<String> {
+    req.headers
+        .iter()
+        .flat_map(|h| match h {
+            Header::Route(routes) => routes.clone(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn message_proxy_authorization_value(req: &Request) -> Option<&str> {
+    req.headers.iter().find_map(|h| match h {
+        Header::ProxyAuthorization(v) => Some(v.as_str()),
+        _ => None,
+    })
+}
+
+fn collect_path_headers(req: &Request) -> Vec<String> {
+    let mut out = Vec::new();
+    for h in &req.headers {
+        if let Header::Path(p) = h {
+            out.extend(p.iter().cloned());
+        }
+    }
+    out
+}
+
+fn sip_instance_from_contact(cv: &ContactValue) -> Option<String> {
+    cv.params.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("+sip.instance") {
+            v.as_ref().map(|s| s.trim_matches('"').to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn reg_id_from_contact(cv: &ContactValue) -> Option<u32> {
+    cv.params.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("reg-id") {
+            v.as_ref()?.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn binding_from_register(
+    contact: &ContactValue,
+    req: &Request,
+    domain: &str,
+    user: &str,
+    expires: u32,
+) -> ContactBinding {
+    let path = collect_path_headers(req);
+    let sip_inst = sip_instance_from_contact(contact);
+    let reg_id = reg_id_from_contact(contact);
+    let (pub_gruu, temp_gruu) = match sip_inst.as_ref() {
+        Some(inst) if !inst.is_empty() => (
+            Some(gruu::compute_pub_gruu(domain, user, inst)),
+            Some(gruu::new_temp_gruu(domain, user)),
+        ),
+        _ => (None, None),
+    };
+    ContactBinding {
+        uri: contact.uri.clone(),
+        q_value: contact.q_value(),
+        expires,
+        sip_instance: sip_inst,
+        pub_gruu,
+        temp_gruu,
+        reg_id,
+        path,
+        ..Default::default()
+    }
+}
+
+fn merge_register_contact(
+    contact_in: &ContactValue,
+    binding: &ContactBinding,
+    expires: u32,
+) -> ContactValue {
+    let mut params = contact_in.params.clone();
+    let upsert = |params: &mut Vec<(String, Option<String>)>, key: &str, val: &str| {
+        let quoted = format!("\"{}\"", val.trim_matches('"'));
+        if let Some((_, v)) = params.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            *v = Some(quoted);
+        } else {
+            params.push((key.to_string(), Some(quoted)));
+        }
+    };
+    if let Some(ref pg) = binding.pub_gruu {
+        upsert(&mut params, "pub-gruu", pg);
+    }
+    if let Some(ref tg) = binding.temp_gruu {
+        upsert(&mut params, "temp-gruu", tg);
+    }
+    ContactValue {
+        uri: contact_in.uri.clone(),
+        q: contact_in.q.or(Some(binding.q_value)),
+        expires: Some(expires),
+        params,
+    }
+}
+
+fn register_success_response(
+    req: &Request,
+    contact_in: &ContactValue,
+    binding: &ContactBinding,
+    expires: u32,
+    cfg: &UdpProxyConfig,
+) -> Response {
+    let mut headers = Vec::new();
+    for h in &req.headers {
+        match h {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_) => headers.push(h.clone()),
+            Header::Contact(_) => {}
+            _ => {}
+        }
+    }
+    let cv = merge_register_contact(contact_in, binding, expires);
+    headers.push(Header::Contact(vec![cv]));
+    if !binding.path.is_empty() {
+        headers.push(Header::Path(binding.path.clone()));
+    }
+    if let Some(ref edge) = cfg.outbound_edge_uri {
+        headers.push(Header::ServiceRoute(vec![edge.clone()]));
+    }
+    headers.push(Header::Expires(expires));
+    headers.push(Header::ContentLength(0));
+    Response {
+        version: SipVersion::V2_0,
+        status: StatusCode::OK,
+        reason: StatusCode::OK.reason_phrase().to_owned(),
+        headers,
+        body: Vec::new(),
+    }
+}
+
+async fn message_forward_to_bindings(
+    sip_sender: &Arc<dyn MessageSender>,
+    cfg: &UdpProxyConfig,
+    req: &Request,
+    bindings: &[ContactBinding],
+) {
+    for b in bindings {
+        let mut fwd = req.clone();
+        fwd.uri = b.uri.clone();
+        prepend_proxy_via(&mut fwd, &cfg.advertise, cfg.sip_port);
+        if !b.path.is_empty() {
+            fwd.headers.insert(1, Header::Route(b.path.clone()));
+        }
+        let msg = SipMessage::Request(fwd);
+        match crate::notify::resolve_message_target(&b.uri).await {
+            Ok(t) => {
+                if let Err(e) = sip_sender.send_sip(&t, msg).await {
+                    tracing::warn!(%e, uri = %b.uri, "MESSAGE forward");
+                }
+            }
+            Err(e) => tracing::warn!(%e, uri = %b.uri, "MESSAGE resolve target"),
+        }
+    }
+}
+
+async fn subscribe_notify_body(
+    redis: &RedisPool,
+    dom: &str,
+    user: &str,
+    event_pkg: &str,
+) -> anyhow::Result<(Vec<u8>, String)> {
+    let base = event_pkg.split(';').next().unwrap_or(event_pkg).trim();
+    match base {
+        "reg" => {
+            let bindings = list_contact_uris(redis, dom, user)
+                .await
+                .unwrap_or_default();
+            let aor = format!("sip:{user}@{dom}");
+            let xml = reginfo_xml(&aor, &bindings, 1);
+            Ok((xml.into_bytes(), "application/reginfo+xml".into()))
+        }
+        "presence" => match load_presence(redis, dom, user).await {
+            Ok(Some(d)) => Ok((presence_body_from_doc(&d.body), d.content_type)),
+            Ok(None) => Ok((Vec::new(), "application/pidf+xml".into())),
+            Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        },
+        _ => Ok((Vec::new(), String::new())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_subscribe_initial_notify(
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    dom: &str,
+    user: &str,
+    sub: &Subscription,
+    event_pkg: &str,
+    expires: u32,
+) -> anyhow::Result<()> {
+    let ttl = expires.saturating_add(300).max(600) as i64;
+    let cseq = next_notify_cseq(redis, &sub.call_id, ttl)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (body, ct) = subscribe_notify_body(redis, dom, user, event_pkg).await?;
+    let notify_req = build_notify_request(
+        sub,
+        &body,
+        &ct,
+        SubscriptionStateValue::Active,
+        Some(expires),
+        None,
+        event_pkg,
+        cseq,
+        &cfg.advertise,
+        cfg.sip_port,
+    );
+    dispatch_notify(sip_sender.as_ref(), &sub.contact, notify_req).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_notify_subscribers(
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    dom: &str,
+    user: &str,
+    body: &[u8],
+    ct: &str,
+    expires: u32,
+) -> anyhow::Result<()> {
+    let subs = list_subscriptions_for_aor(redis, dom, user, "presence")
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let ttl = expires.saturating_add(300).max(600) as i64;
+    for sub in subs {
+        let cseq = match next_notify_cseq(redis, &sub.call_id, ttl).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(%e, "publish notify cseq");
+                continue;
+            }
+        };
+        let hdr = sub.event_package.as_str();
+        let notify_req = build_notify_request(
+            &sub,
+            body,
+            ct,
+            SubscriptionStateValue::Active,
+            Some(expires),
+            None,
+            hdr,
+            cseq,
+            &cfg.advertise,
+            cfg.sip_port,
+        );
+        if let Err(e) = dispatch_notify(sip_sender.as_ref(), &sub.contact, notify_req).await {
+            tracing::warn!(%e, sub_id = %sub.id, "publish fan-out notify");
+            if let Err(del_e) = delete_subscription(redis, dom, user, "presence", &sub.id).await {
+                tracing::warn!(%del_e, "purge subscription after notify failure");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_message(
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    req: Request,
+) -> anyhow::Result<()> {
+    let max_body = 1300usize.min(cfg.max_message_bytes);
+    if req.body.len() > max_body {
+        crate::ingress::respond(
+            ingress,
+            &sip_response(&req, StatusCode::REQUEST_ENTITY_TOO_LARGE),
+        )
+        .await;
+        return Ok(());
+    }
+    let to_uri = req.to_header().map(|t| t.uri.clone());
+    let parsed = parse_sip_user_host(&req.uri)
+        .or_else(|| to_uri.as_ref().and_then(|u| parse_sip_user_host(u)));
+    let Some((user, dom_raw)) = parsed else {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    let dom = normalize_domain(dom_raw, &cfg.domain);
+    let auth_raw = message_proxy_authorization_value(&req);
+    if auth_raw.is_none() {
+        return message_send_digest_challenge(ingress, redis, cfg, &req, &user, &dom, false).await;
+    }
+    let Some(dr) = DigestResponse::parse(auth_raw.unwrap()) else {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    if !dr.username.eq_ignore_ascii_case(&user) || !dr.realm.eq_ignore_ascii_case(&dom) {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::FORBIDDEN)).await;
+        return Ok(());
+    }
+    match register_nonce_exists(redis, &dr.nonce).await {
+        Ok(false) => {
+            return message_send_digest_challenge(ingress, redis, cfg, &req, &user, &dom, true)
+                .await;
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(%e, "message redis nonce exists");
+            crate::ingress::respond(ingress, &overload_response(&req, 30)).await;
+            return Ok(());
+        }
+    }
+    if !register_digest_verified(ingress, redis, cfg, &req, &dom, &dr, "MESSAGE").await? {
+        return Ok(());
+    }
+    if !register_enforce_digest_nc(ingress, redis, cfg, &req, &dr).await? {
+        return Ok(());
+    }
+    let bindings = match list_contact_uris(redis, &dom, &user).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(%e, "message location");
+            crate::ingress::respond(
+                ingress,
+                &sip_response(&req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if bindings.is_empty() {
+        crate::ingress::respond(
+            ingress,
+            &SipMessage::Response(ProxyRouter::not_found_response(&req)),
+        )
+        .await;
+        return Ok(());
+    }
+    crate::ingress::respond(ingress, &sip_response(&req, StatusCode::ACCEPTED)).await;
+    message_forward_to_bindings(sip_sender, cfg, &req, &bindings).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_notify(
+    ingress: &ProxyIngress,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    forward_table: &ForwardTable,
+    transaction_table: &TransactionTable,
+    dialog_table: &DialogTable,
+    refresh_table: &RefreshTable,
+    req: Request,
+) -> anyhow::Result<()> {
+    if dialog_for_request(dialog_table, &req).await.is_some() {
+        if notify_event_package_is_refer(&req)
+            && let Some(cid) = req.call_id()
+        {
+            correlate_refer_notify_with_redis(redis, cid, &req).await;
+        }
+        if notify_is_refer_terminated(&req)
+            && let Some(cid) = req.call_id()
+        {
+            let _ = crate::refer_state::delete_refer_state(redis, cid).await;
+        }
+        return handle_dialog_request(
+            ingress,
+            redis,
+            cfg,
+            forward_table,
+            transaction_table,
+            dialog_table,
+            refresh_table,
+            req,
+        )
+        .await;
+    }
+    crate::ingress::respond(ingress, &sip_response(&req, StatusCode::OK)).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_publish(
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    req: Request,
+) -> anyhow::Result<()> {
+    let Some(to) = req.to_header() else {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    let Some((user, dom_raw)) = parse_sip_user_host(&to.uri) else {
+        crate::ingress::respond(
+            ingress,
+            &SipMessage::Response(ProxyRouter::not_found_response(&req)),
+        )
+        .await;
+        return Ok(());
+    };
+    let dom = normalize_domain(dom_raw, &cfg.domain);
+    let exp = req.expires().unwrap_or(3600).clamp(60, 86400);
+    let ct = header_content_type(&req).unwrap_or_else(|| "application/pidf+xml".to_string());
+    let if_match = header_sip_if_match(&req);
+    match publish_presence(
+        redis,
+        &dom,
+        &user,
+        Some(req.body.as_slice()),
+        ct.as_str(),
+        if_match.as_deref(),
+        exp,
+    )
+    .await
+    {
+        Ok(etag) => {
+            let body = req.body.clone();
+            crate::ingress::respond(ingress, &sip_ok_sip_etag(&req, etag)).await;
+            if let Err(e) = publish_notify_subscribers(
+                sip_sender,
+                redis,
+                cfg,
+                &dom,
+                &user,
+                &body,
+                ct.as_str(),
+                exp,
+            )
+            .await
+            {
+                tracing::warn!(%e, "publish subscriber notify");
+            }
+        }
+        Err(PresenceError::EtagMismatch) | Err(PresenceError::NotFound) => {
+            crate::ingress::respond(
+                ingress,
+                &sip_response(&req, StatusCode::PRECONDITION_FAILED),
+            )
+            .await;
+        }
+        Err(PresenceError::Redis(e)) => {
+            tracing::warn!(%e, "publish presence");
+            crate::ingress::respond(
+                ingress,
+                &sip_response(&req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_subscribe(
+    ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    req: Request,
+) -> anyhow::Result<()> {
+    let Some(to) = req.to_header() else {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    let Some((user, dom_raw)) = parse_sip_user_host(&to.uri) else {
+        crate::ingress::respond(
+            ingress,
+            &SipMessage::Response(ProxyRouter::not_found_response(&req)),
+        )
+        .await;
+        return Ok(());
+    };
+    let dom = normalize_domain(dom_raw, &cfg.domain);
+    let Some(call_id) = req.call_id() else {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    let Some(from_na) = req.headers.iter().find_map(|h| match h {
+        Header::From(na) => Some(na.clone()),
+        _ => None,
+    }) else {
+        crate::ingress::respond(ingress, &sip_response(&req, StatusCode::BAD_REQUEST)).await;
+        return Ok(());
+    };
+    let contact_uri = req
+        .contacts()
+        .first()
+        .map(|c| c.uri.clone())
+        .unwrap_or_default();
+    let event_pkg = header_event_package(&req);
+    let expires = req.expires().unwrap_or(3600).clamp(60, 86400);
+    let sub = Subscription {
+        id: Uuid::new_v4().simple().to_string(),
+        aor: format!("{user}@{dom}"),
+        subscriber_uri: from_na.uri.clone(),
+        event_package: event_pkg.clone(),
+        call_id: call_id.to_string(),
+        from_tag: from_na.tag.unwrap_or_default(),
+        to_tag: String::new(),
+        expires,
+        state: "active".to_string(),
+        contact: contact_uri,
+        route_set: collect_route_set(&req),
+    };
+    match save_subscription(redis, &dom, &user, &sub).await {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::warn!(%e, "subscribe save");
+            crate::ingress::respond(
+                ingress,
+                &sip_response(&req, StatusCode::SERVER_INTERNAL_ERROR),
+            )
+            .await;
+            return Ok(());
+        }
+    }
+    crate::ingress::respond(
+        ingress,
+        &sip_response_expires(&req, StatusCode::OK, expires),
+    )
+    .await;
+    if let Err(e) = dispatch_subscribe_initial_notify(
+        sip_sender, redis, cfg, &dom, &user, &sub, &event_pkg, expires,
+    )
+    .await
+    {
+        tracing::warn!(%e, "subscribe initial notify");
+    }
+    Ok(())
+}
+
 fn simple_ok(req: &Request) -> Response {
     let mut headers = Vec::new();
     for h in &req.headers {
@@ -2556,6 +3985,13 @@ fn parse_contact_target(contact_uri: &str) -> Option<ContactTarget> {
         port,
         transport: contact_transport(uri)?,
     })
+}
+
+/// Host and port from a SIP/SIPS Contact URI (for NOTIFY resolution).
+pub(crate) fn contact_host_port(contact_uri: &str) -> Option<(String, Option<u16>)> {
+    let uri = strip_name_addr(contact_uri);
+    let (_, hostport) = parse_sip_user_host(uri)?;
+    split_host_port_optional(&hostport)
 }
 
 fn contact_transport(uri: &str) -> Option<SipTransport> {
@@ -2638,9 +4074,14 @@ fn split_host_port(rest: &str) -> Option<(String, u16)> {
 mod tests {
     use super::*;
     use crate::forward_table::{PendingForward, new_forward_table};
+    use crate::message_sender::UdpSender;
     use sipora_sip::types::header::{CSeq, NameAddr, RportParam};
     use sqlx::postgres::PgPoolOptions;
     use std::time::Instant;
+
+    fn test_sip_sender(sock: &Arc<tokio::net::UdpSocket>) -> Arc<dyn MessageSender> {
+        Arc::new(UdpSender::new(sock.clone()))
+    }
 
     #[test]
     fn parse_sip_user_host_accepts_ipv6_literal_without_user() {
@@ -2650,6 +4091,15 @@ mod tests {
             parsed,
             Some(("".to_string(), "[2001:db8::1]:5070".to_string()))
         );
+    }
+
+    #[test]
+    fn refer_notify_event_id_parsing() {
+        assert_eq!(
+            notify_refer_event_id_from_header("refer;id=abc123").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(notify_refer_event_id_from_header("refer").as_deref(), None);
     }
 
     #[test]
@@ -2914,15 +4364,23 @@ mod tests {
                 uri: "sip:bob@127.0.0.1;transport=tcp".to_string(),
                 q_value: 1.0,
                 expires: 300,
+                ..Default::default()
             },
             ContactBinding {
                 uri: "sip:bob@127.0.0.1:5097".to_string(),
                 q_value: 0.5,
                 expires: 300,
+                ..Default::default()
             },
         ];
 
-        let selected = select_initial_invite_target(&invite_request(), contacts).await;
+        let selected = select_initial_invite_target(
+            &invite_request(),
+            contacts,
+            "bob".into(),
+            "example.com".into(),
+        )
+        .await;
 
         let InitialInviteTarget::Selected(route) = selected else {
             panic!("expected later UDP contact to be selected");
@@ -2939,9 +4397,11 @@ mod tests {
             uri: "sip:bob@127.0.0.1;transport=tcp".to_string(),
             q_value: 1.0,
             expires: 300,
+            ..Default::default()
         }];
 
-        let selected = select_initial_invite_target(&req, contacts).await;
+        let selected =
+            select_initial_invite_target(&req, contacts, "bob".into(), "example.com".into()).await;
 
         let InitialInviteTarget::Downgrade(status) = selected else {
             panic!("expected downgrade to be reported before UDP filtering");
@@ -2970,6 +4430,8 @@ mod tests {
             vec![],
             "proxy.example.com",
             5060,
+            &[],
+            None,
         )
         .await
         .unwrap();
@@ -2990,6 +4452,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_invite_inserts_path_route_after_top_via() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let peer = "127.0.0.1:5090".parse().unwrap();
+        let table = new_forward_table();
+        let transaction_table = new_transaction_table();
+        let path = vec!["<sip:edge.example.com;lr>".to_string()];
+
+        forward_invite_request(
+            &socket,
+            &table,
+            &transaction_table,
+            peer,
+            invite_request(),
+            "sip:bob@127.0.0.1:5091".to_string(),
+            target_addr,
+            Some(invite_request()),
+            vec![],
+            "proxy.example.com",
+            5060,
+            &path,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = target.recv_from(&mut buf).await.unwrap();
+        let (_, msg) = parse_sip_message(&buf[..n]).unwrap();
+        let SipMessage::Request(forwarded) = msg else {
+            panic!("expected request");
+        };
+        assert!(matches!(&forwarded.headers[0], Header::Via(_)));
+        assert!(matches!(&forwarded.headers[1], Header::Route(r) if r == &path));
+    }
+
+    #[tokio::test]
     async fn forward_next_fork_sends_invite_to_remaining_target() {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2998,6 +4498,7 @@ mod tests {
         let cfg = test_cfg();
         let pending = PendingForward {
             client_addr: "127.0.0.1:5090".parse().unwrap(),
+            reply_ws_conn_id: None,
             target_addr,
             original_via_stack: vec![],
             original_request: Some(invite_request()),
@@ -3006,6 +4507,7 @@ mod tests {
             final_forwarded: false,
             inserted_at: Instant::now(),
             last_reliable_rseq: None,
+            last_prack_rack: None,
         };
 
         let transaction_table = new_transaction_table();
@@ -3032,18 +4534,24 @@ mod tests {
         let fork_table = new_fork_table();
 
         let cfg = test_cfg();
+        let peer: SocketAddr = "127.0.0.1:5090".parse().unwrap();
+        let ingress = ProxyIngress::udp(socket.clone(), peer);
         forward_initial_invite(
-            &socket,
+            &ingress,
+            None,
             &table,
             &transaction_table,
             &fork_table,
             &cfg,
-            "127.0.0.1:5090".parse().unwrap(),
             invite_request(),
             InitialInviteRoute {
                 target_uri: format!("sip:bob@{first_addr}"),
                 target: first_addr,
                 remaining_targets: vec![format!("sip:bob@{second_addr}")],
+                path: vec![],
+                push_contact: None,
+                callee_user: String::new(),
+                callee_domain: String::new(),
             },
         )
         .await
@@ -3069,18 +4577,24 @@ mod tests {
 
         let mut cfg = test_cfg();
         cfg.fork_parallel = false;
+        let peer: SocketAddr = "127.0.0.1:5090".parse().unwrap();
+        let ingress = ProxyIngress::udp(socket.clone(), peer);
         forward_initial_invite(
-            &socket,
+            &ingress,
+            None,
             &table,
             &transaction_table,
             &fork_table,
             &cfg,
-            "127.0.0.1:5090".parse().unwrap(),
             invite_request(),
             InitialInviteRoute {
                 target_uri: format!("sip:bob@{first_addr}"),
                 target: first_addr,
                 remaining_targets: vec![format!("sip:bob@{second_addr}")],
+                path: vec![],
+                push_contact: None,
+                callee_user: String::new(),
+                callee_domain: String::new(),
             },
         )
         .await
@@ -3112,6 +4626,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3143,6 +4658,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3157,6 +4673,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3190,6 +4707,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3204,6 +4722,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3229,6 +4748,7 @@ mod tests {
         insert_test_forward(&table, "z9hG4bK-cancel", client_addr, client_addr).await;
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &new_fork_table(),
@@ -3258,6 +4778,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3272,6 +4793,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3313,6 +4835,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3327,6 +4850,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &fork_table,
@@ -3374,6 +4898,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_string(),
             client_addr,
+            None,
             "127.0.0.1:5099".parse().unwrap(),
             vec![client_via()],
             Some(invite_request()),
@@ -3388,6 +4913,7 @@ mod tests {
 
         dispatch_response(
             &socket,
+            &test_sip_sender(&socket),
             &cfg,
             &table,
             &new_fork_table(),
@@ -3424,6 +4950,7 @@ mod tests {
             table,
             branch.to_string(),
             client_addr,
+            None,
             target_addr,
             vec![client_via()],
             Some(invite_request()),
@@ -3539,6 +5066,13 @@ mod tests {
                 .connect_lazy("postgres://localhost/sipora")
                 .unwrap(),
             stir: StirConfig::default(),
+            max_message_bytes: 65535,
+            outbound_edge_uri: None,
+            push_gateway_url: None,
+            push_timeout_ms: 5000,
+            push_auth_bearer: None,
+            push_device_idle_secs: 120,
+            http_client: reqwest::Client::new(),
         }
     }
 

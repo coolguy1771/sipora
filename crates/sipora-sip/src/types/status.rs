@@ -8,12 +8,17 @@ impl StatusCode {
     pub const RINGING: Self = Self(180);
     pub const SESSION_PROGRESS: Self = Self(183);
     pub const OK: Self = Self(200);
+    pub const ACCEPTED: Self = Self(202);
     pub const MOVED_PERMANENTLY: Self = Self(301);
     pub const MOVED_TEMPORARILY: Self = Self(302);
     pub const BAD_REQUEST: Self = Self(400);
     pub const UNAUTHORIZED: Self = Self(401);
     pub const FORBIDDEN: Self = Self(403);
     pub const NOT_FOUND: Self = Self(404);
+    /// RFC 3903 / conditional requests.
+    pub const PRECONDITION_FAILED: Self = Self(412);
+    /// Payload too large (HTTP-derived use in SIP MESSAGE bodies).
+    pub const REQUEST_ENTITY_TOO_LARGE: Self = Self(413);
     pub const METHOD_NOT_ALLOWED: Self = Self(405);
     pub const PROXY_AUTH_REQUIRED: Self = Self(407);
     pub const REQUEST_TIMEOUT: Self = Self(408);
@@ -32,6 +37,8 @@ impl StatusCode {
     pub const TOO_MANY_HOPS: Self = Self(483);
     pub const BUSY_HERE: Self = Self(486);
     pub const NOT_ACCEPTABLE_HERE: Self = Self(488);
+    /// RFC 3265 / 6665 unknown Event package.
+    pub const BAD_EVENT: Self = Self(489);
     pub const NOT_IMPLEMENTED: Self = Self(501);
     pub const SERVER_INTERNAL_ERROR: Self = Self(500);
     pub const SERVICE_UNAVAILABLE: Self = Self(503);
@@ -43,12 +50,15 @@ impl StatusCode {
             180 => "Ringing",
             183 => "Session Progress",
             200 => "OK",
+            202 => "Accepted",
             301 => "Moved Permanently",
             302 => "Moved Temporarily",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            412 => "Precondition Failed",
+            413 => "Request Entity Too Large",
             405 => "Method Not Allowed",
             407 => "Proxy Authentication Required",
             408 => "Request Timeout",
@@ -63,6 +73,7 @@ impl StatusCode {
             483 => "Too Many Hops",
             486 => "Busy Here",
             488 => "Not Acceptable Here",
+            489 => "Bad Event",
             501 => "Not Implemented",
             500 => "Server Internal Error",
             503 => "Service Unavailable",

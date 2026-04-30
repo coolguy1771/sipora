@@ -68,7 +68,10 @@ fn serialize_header_value(header: &Header, buf: &mut Vec<u8>) {
             buf.extend_from_slice(n.to_string().as_bytes());
         }
         Header::ContentType(ct) => buf.extend_from_slice(ct.as_bytes()),
-        Header::Route(routes) | Header::RecordRoute(routes) => {
+        Header::Route(routes)
+        | Header::RecordRoute(routes)
+        | Header::Path(routes)
+        | Header::ServiceRoute(routes) => {
             buf.extend_from_slice(routes.join(", ").as_bytes());
         }
         Header::Expires(e) | Header::MinExpires(e) | Header::RetryAfter(e) => {
@@ -108,8 +111,32 @@ fn serialize_header_value(header: &Header, buf: &mut Vec<u8>) {
         Header::Identity(v) | Header::Extension { value: v, .. } => {
             buf.extend_from_slice(v.as_bytes());
         }
-        Header::PAssertedIdentity(na) | Header::PPreferredIdentity(na) => {
+        Header::PAssertedIdentity(na) | Header::PPreferredIdentity(na) | Header::ReferredBy(na) => {
             serialize_name_addr(na, buf);
+        }
+        Header::SubscriptionState {
+            state,
+            expires,
+            reason,
+        } => {
+            buf.extend_from_slice(state.as_str().as_bytes());
+            if let Some(e) = expires {
+                buf.extend_from_slice(format!(";expires={e}").as_bytes());
+            }
+            if let Some(r) = reason {
+                buf.extend_from_slice(format!(";reason={r}").as_bytes());
+            }
+        }
+        Header::Event(ev) => buf.extend_from_slice(ev.as_bytes()),
+        Header::SipEtag(v) | Header::SipIfMatch(v) => buf.extend_from_slice(v.as_bytes()),
+        Header::ReferTo(v) => buf.extend_from_slice(v.as_bytes()),
+        Header::Replaces {
+            call_id,
+            from_tag,
+            to_tag,
+        } => {
+            buf.extend_from_slice(call_id.as_bytes());
+            buf.extend_from_slice(format!(";from-tag={from_tag};to-tag={to_tag}").as_bytes());
         }
     }
 }
@@ -154,6 +181,18 @@ fn serialize_name_addr(na: &NameAddr, buf: &mut Vec<u8>) {
         buf.extend_from_slice(b";tag=");
         buf.extend_from_slice(tag.as_bytes());
     }
+    serialize_generic_params(&na.params, buf);
+}
+
+fn serialize_generic_params(params: &[(String, Option<String>)], buf: &mut Vec<u8>) {
+    for (k, v) in params {
+        buf.push(b';');
+        buf.extend_from_slice(k.as_bytes());
+        if let Some(val) = v {
+            buf.push(b'=');
+            buf.extend_from_slice(val.as_bytes());
+        }
+    }
 }
 
 fn serialize_contacts(contacts: &[ContactValue], buf: &mut Vec<u8>) {
@@ -174,6 +213,7 @@ fn serialize_contacts(contacts: &[ContactValue], buf: &mut Vec<u8>) {
         if let Some(e) = c.expires {
             buf.extend_from_slice(format!(";expires={e}").as_bytes());
         }
+        serialize_generic_params(&c.params, buf);
     }
 }
 

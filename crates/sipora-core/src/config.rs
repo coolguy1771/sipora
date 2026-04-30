@@ -20,6 +20,8 @@ pub struct SiporaConfig {
     pub kafka: KafkaConfig,
     pub b2bua: B2buaConfig,
     pub stir: StirConfig,
+    pub transport: TransportConfig,
+    pub push: PushConfig,
 }
 
 /// B2BUA: back-to-back SIP signaling toward a downstream peer (B-leg).
@@ -158,6 +160,9 @@ pub struct RegistrarConfig {
     pub default_expires: u32,
     #[serde(default = "default_nonce_ttl_s")]
     pub nonce_ttl_s: u64,
+    /// Optional outbound edge URI for Service-Route / Path scenarios (labs).
+    #[serde(default)]
+    pub outbound_edge_uri: Option<String>,
 }
 
 impl Default for RegistrarConfig {
@@ -167,6 +172,67 @@ impl Default for RegistrarConfig {
             max_expires: default_max_expires(),
             default_expires: default_default_expires(),
             nonce_ttl_s: default_nonce_ttl_s(),
+            outbound_edge_uri: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TransportConfig {
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+}
+
+fn default_max_message_bytes() -> usize {
+    65535
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: default_max_message_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PushConfig {
+    #[serde(default)]
+    pub fcm_credentials_path: Option<String>,
+    #[serde(default)]
+    pub apns_topic: Option<String>,
+    /// Generic push gateway URL (HTTPS). When unset, `wake_device` is not used.
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+    #[serde(default = "default_push_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Name of an environment variable holding a bearer token for the gateway.
+    #[serde(default)]
+    pub auth_bearer_env: Option<String>,
+    /// Treat bindings with push params as idle if last REGISTER older than this (seconds).
+    #[serde(default = "default_push_device_idle_secs")]
+    pub device_idle_secs: u64,
+}
+
+fn default_push_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_push_device_idle_secs() -> u64 {
+    120
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            fcm_credentials_path: None,
+            apns_topic: None,
+            gateway_url: None,
+            timeout_ms: default_push_timeout_ms(),
+            auth_bearer_env: None,
+            device_idle_secs: default_push_device_idle_secs(),
         }
     }
 }
@@ -182,6 +248,13 @@ pub struct ProxyConfig {
     pub trace_header: String,
     #[serde(default = "default_location_timeout_ms")]
     pub location_timeout_ms: u64,
+    /// SIP over WebSocket listen port on the proxy (`0` = disabled).
+    #[serde(default = "default_proxy_ws_listen_port")]
+    pub ws_listen_port: u16,
+}
+
+fn default_proxy_ws_listen_port() -> u16 {
+    0
 }
 
 impl Default for ProxyConfig {
@@ -191,6 +264,7 @@ impl Default for ProxyConfig {
             fork_parallel: default_true(),
             trace_header: default_trace_header(),
             location_timeout_ms: default_location_timeout_ms(),
+            ws_listen_port: default_proxy_ws_listen_port(),
         }
     }
 }
@@ -302,6 +376,12 @@ impl Default for TelemetryConfig {
 pub struct MediaConfig {
     #[serde(default = "default_rtpengine_host")]
     pub rtpengine_host: String,
+    /// ICE handling for rtpengine ng `offer`/`answer` commands: `remove`, `force`, or `optional`.
+    #[serde(default = "default_rtpengine_ice")]
+    pub rtpengine_ice: String,
+    /// DTLS mode for rtpengine ng commands: `passive` or `off`.
+    #[serde(default = "default_rtpengine_dtls")]
+    pub rtpengine_dtls: String,
     #[serde(default = "default_allowed_codecs")]
     pub allowed_codecs: Vec<String>,
     #[serde(default = "default_true")]
@@ -314,6 +394,8 @@ impl Default for MediaConfig {
     fn default() -> Self {
         Self {
             rtpengine_host: default_rtpengine_host(),
+            rtpengine_ice: default_rtpengine_ice(),
+            rtpengine_dtls: default_rtpengine_dtls(),
             allowed_codecs: default_allowed_codecs(),
             srtp_required: default_true(),
             rtp_timeout_s: default_rtp_timeout_s(),
@@ -534,6 +616,12 @@ fn default_success_sample_rate() -> f64 {
 }
 fn default_rtpengine_host() -> String {
     "rtp-proxy".into()
+}
+fn default_rtpengine_ice() -> String {
+    "remove".into()
+}
+fn default_rtpengine_dtls() -> String {
+    "passive".into()
 }
 fn default_allowed_codecs() -> Vec<String> {
     vec!["opus".into(), "G722".into(), "G711u".into(), "G711a".into()]

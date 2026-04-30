@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Parsing
 nom = "8"
+regex = "1"
 
 # SDP
 sdp-types = "0.1"
@@ -104,7 +105,6 @@ x509-cert = { version = "0.2", features = ["pem"] }
 url = "2"
 hickory-resolver = "0.26.0"
 moka = { version = "0.12.15", features = ["future"] }
-
 # Workspace crates
 sipora-core = { path = "crates/sipora-core" }
 sipora-sip = { path = "crates/sipora-sip" }

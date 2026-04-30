@@ -3512,6 +3512,7 @@ dependencies = [
  "sipora-auth",
  "sipora-core",
  "sipora-data",
+ "sipora-media",
  "sipora-sdp",
  "sipora-sip",
  "sipora-transport",
@@ -3571,9 +3572,11 @@ dependencies = [
  "fred",
  "sipora-core",
  "sipora-sip",
+ "sipora-transport",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3589,6 +3592,7 @@ dependencies = [
  "sipora-transport",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3610,12 +3614,15 @@ name = "sipora-location"
 version = "0.1.0"
 dependencies = [
  "fred",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sipora-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3648,10 +3655,16 @@ name = "sipora-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "base64",
+ "bytes",
  "clap",
  "fred",
  "moka",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
  "sipora-auth",
  "sipora-core",
  "sipora-data",
@@ -3661,6 +3674,7 @@ dependencies = [
  "sipora-transport",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
 ]
@@ -3696,6 +3710,7 @@ dependencies = [
  "hickory-resolver",
  "moka",
  "rand 0.10.1",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "sipora-core",

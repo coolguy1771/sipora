@@ -36,6 +36,46 @@ pub fn location_key(domain: &str, user: &str) -> String {
     format!("{LOCATION_KEY_PREFIX}:{domain}:{user}")
 }
 
+/// Maps pub-GRUU `gr` token fragment to registered username at this domain.
+pub fn pub_gruu_index_key(domain: &str, gr_token: &str) -> String {
+    format!("gruu:{domain}:{gr_token}")
+}
+
+pub fn subscription_key(event: &str, domain: &str, user: &str, call_id: &str) -> String {
+    format!("sub:{event}:{domain}:{user}:{call_id}")
+}
+
+pub fn subscription_aor_index(event: &str, domain: &str, user: &str) -> String {
+    format!("subidx:{event}:{domain}:{user}")
+}
+
+/// Monotonic NOTIFY CSeq per dialog (`Call-ID`).
+pub fn subscription_notify_cseq_key(call_id: &str) -> String {
+    format!("subnotifycseq:{call_id}")
+}
+
+pub fn presence_doc_key(domain: &str, user: &str) -> String {
+    format!("presence:{domain}:{user}")
+}
+
+pub fn presence_etag_key(domain: &str, user: &str) -> String {
+    format!("presence_etag:{domain}:{user}")
+}
+
+pub fn push_pending_key(call_id: &str) -> String {
+    format!("push_pending:{call_id}")
+}
+
+/// FIFO of Call-IDs with stashed INVITE bodies for push replay after REGISTER.
+pub fn push_pending_index_key(domain: &str, user: &str) -> String {
+    format!("push_pending_idx:{domain}:{user}")
+}
+
+/// Serialized REFER dialog state for the proxy (JSON blob).
+pub fn refer_state_key(call_id: &str) -> String {
+    format!("refer_state:{call_id}")
+}
+
 pub fn nonce_key(domain: &str, nonce: &str) -> String {
     format!("{NONCE_KEY_PREFIX}:{domain}:{nonce}")
 }

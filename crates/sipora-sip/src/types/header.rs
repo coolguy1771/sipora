@@ -41,10 +41,53 @@ pub enum Header {
     PAssertedIdentity(NameAddr),
     /// RFC 3325 preferred identity hint (UA → proxy).
     PPreferredIdentity(NameAddr),
+    /// RFC 3327 Path header (comma-separated name-addrs or URIs as stored strings).
+    Path(Vec<String>),
+    /// RFC 3608 Service-Route (comma-separated).
+    ServiceRoute(Vec<String>),
+    /// RFC 6665 Subscription-State.
+    SubscriptionState {
+        state: SubscriptionStateValue,
+        expires: Option<u32>,
+        reason: Option<String>,
+    },
+    /// RFC 6665 Event header (package name).
+    Event(String),
+    /// RFC 3903 SIP-ETag.
+    SipEtag(String),
+    /// RFC 3903 SIP-If-Match.
+    SipIfMatch(String),
+    /// RFC 3515 Refer-To (often a name-addr or URI line; stored raw).
+    ReferTo(String),
+    /// RFC 3892 Referred-By.
+    ReferredBy(NameAddr),
+    /// RFC 3891 Replaces (dialog identifiers).
+    Replaces {
+        call_id: String,
+        from_tag: String,
+        to_tag: String,
+    },
     Extension {
         name: String,
         value: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionStateValue {
+    Active,
+    Pending,
+    Terminated,
+}
+
+impl SubscriptionStateValue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::Terminated => "terminated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +206,15 @@ impl Header {
             Self::Identity(_) => "Identity",
             Self::PAssertedIdentity(_) => "P-Asserted-Identity",
             Self::PPreferredIdentity(_) => "P-Preferred-Identity",
+            Self::Path(_) => "Path",
+            Self::ServiceRoute(_) => "Service-Route",
+            Self::SubscriptionState { .. } => "Subscription-State",
+            Self::Event(_) => "Event",
+            Self::SipEtag(_) => "SIP-ETag",
+            Self::SipIfMatch(_) => "SIP-If-Match",
+            Self::ReferTo(_) => "Refer-To",
+            Self::ReferredBy(_) => "Referred-By",
+            Self::Replaces { .. } => "Replaces",
             Self::Extension { name, .. } => name.as_str(),
         }
     }

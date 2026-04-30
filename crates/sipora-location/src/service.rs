@@ -30,12 +30,17 @@ impl LocationService {
         self.publish_events
     }
 
-    /// Score = q_value, member = contact_uri
+    /// Score = q_value, member = JSON [`ContactBinding`] or raw URI (legacy).
     pub fn parse_binding(member: &str, score: f64) -> ContactBinding {
+        if let Ok(mut b) = serde_json::from_str::<ContactBinding>(member) {
+            b.q_value = score as f32;
+            return b;
+        }
         ContactBinding {
             uri: member.to_owned(),
             q_value: score as f32,
             expires: 0,
+            ..Default::default()
         }
     }
 

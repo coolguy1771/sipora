@@ -1,10 +1,21 @@
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+
+use crate::TransportType;
+
+type WsTcpStream = WebSocketStream<TcpStream>;
+type WsSplitSink = SplitSink<WsTcpStream, Message>;
+type WsSplitRead = SplitStream<WsTcpStream>;
 
 pub struct WebSocketTransport {
     listener: TcpListener,
@@ -21,17 +32,33 @@ impl WebSocketTransport {
         self.listener.local_addr()
     }
 
+    /// Accepts TCP and completes the WebSocket handshake (`sip` subprotocol).
+    pub async fn accept_stream(
+        &self,
+    ) -> Result<(WsTcpStream, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
+        let (stream, addr) = self.listener.accept().await?;
+        let ws = handshake_ws(stream).await?;
+        Ok((ws, addr))
+    }
+
     #[allow(clippy::result_large_err)]
     pub async fn accept(
         &self,
     ) -> Result<(WebSocketConnection, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
-        let (stream, addr) = self.listener.accept().await?;
-        let ws_stream = accept_hdr_async(stream, |req: &Request, response| {
-            choose_sip_subprotocol(req, response)
-        })
-        .await?;
-        Ok((WebSocketConnection { inner: ws_stream }, addr))
+        let (ws, addr) = self.accept_stream().await?;
+        Ok((WebSocketConnection::from_upgraded(ws, false), addr))
     }
+}
+
+#[allow(clippy::result_large_err)]
+async fn handshake_ws(
+    stream: TcpStream,
+) -> Result<WsTcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    let ws_stream = accept_hdr_async(stream, |req: &Request, response| {
+        choose_sip_subprotocol(req, response)
+    })
+    .await?;
+    Ok(ws_stream)
 }
 
 #[allow(clippy::result_large_err)]
@@ -62,12 +89,32 @@ fn offers_sip_subprotocol(req: &Request) -> bool {
 }
 
 pub struct WebSocketConnection {
-    inner: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    tls: bool,
+    read: WsSplitRead,
+    write: Arc<Mutex<WsSplitSink>>,
 }
 
 impl WebSocketConnection {
+    /// Wraps an upgraded WebSocket over TCP. Set `tls` to true when the connection uses TLS (wss).
+    pub fn from_upgraded(ws_stream: WsTcpStream, tls: bool) -> Self {
+        let (write, read) = ws_stream.split();
+        Self {
+            tls,
+            read,
+            write: Arc::new(Mutex::new(write)),
+        }
+    }
+
+    pub fn transport_type(&self) -> TransportType {
+        if self.tls {
+            TransportType::Wss
+        } else {
+            TransportType::WebSocket
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        while let Some(msg) = self.inner.next().await {
+        while let Some(msg) = self.read.next().await {
             match msg {
                 Ok(Message::Text(text)) if text == "\r\n" || text == "\r\n\r\n" => continue,
                 Ok(Message::Text(text)) => return Some(text.as_bytes().to_vec()),
@@ -83,13 +130,25 @@ impl WebSocketConnection {
         None
     }
 
-    pub async fn send(
-        &mut self,
-        data: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let text: String = String::from_utf8_lossy(data).into_owned();
-        self.inner.send(Message::Text(text.into())).await?;
+        let mut sink = self.write.lock().await;
+        sink.send(Message::Text(text.into())).await?;
         Ok(())
+    }
+
+    /// Sends CRLF keepalive frames every 30 seconds (RFC 7118-style).
+    pub fn start_keepalive(&self) -> tokio::task::JoinHandle<()> {
+        let write = Arc::clone(&self.write);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let mut sink = write.lock().await;
+                if sink.send(Message::Text("\r\n".into())).await.is_err() {
+                    break;
+                }
+            }
+        })
     }
 }
 
@@ -203,5 +262,75 @@ mod tests {
             received,
             Some(b"OPTIONS sip:example.com SIP/2.0\r\n\r\n".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn transport_returns_websocket_for_plain() {
+        let transport = WebSocketTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = transport.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (conn, _) = transport.accept().await.unwrap();
+            assert_eq!(conn.transport_type(), TransportType::WebSocket);
+        });
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+        let (_client, _) = connect_async(request).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_returns_wss_when_built_with_tls_flag() {
+        let transport = WebSocketTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = transport.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (ws, _) = transport.accept_stream().await.unwrap();
+            let conn = WebSocketConnection::from_upgraded(ws, true);
+            assert_eq!(conn.transport_type(), TransportType::Wss);
+        });
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+        let (_client, _) = connect_async(request).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepalive_sends_crlf_every_interval() {
+        tokio::time::pause();
+
+        let transport = WebSocketTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = transport.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (conn, _) = transport.accept().await.unwrap();
+            let _jh = conn.start_keepalive();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("sip"));
+        let (mut client, _) = connect_async(request).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let msg = client.next().await.expect("message").unwrap();
+        match msg {
+            Message::Text(t) => assert_eq!(t, "\r\n"),
+            other => panic!("expected Text CRLF, got {other:?}"),
+        }
+
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -18,6 +18,7 @@ anyhow = { workspace = true }
 sipora-auth = { workspace = true }
 sipora-core = { workspace = true }
 sipora-sdp = { workspace = true }
+sipora-media = { path = "../../crates/sipora-media" }
 sipora-sip = { workspace = true }
 sipora-transport = { workspace = true }
 sipora-data = { workspace = true }

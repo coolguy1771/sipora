@@ -1,14 +1,12 @@
-mod dialog;
-mod forward_table;
-mod redirect;
-mod routing;
-mod udp;
-
 use anyhow::Result;
 use clap::Parser;
 use sipora_core::health::serve_health;
 use sipora_core::health_ready::AtomicReady;
+use sipora_proxy::{dialog, forward_table, proxy_ws, udp};
+use sipora_transport::tcp_pool::TcpConnectionPool;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 #[derive(Parser)]
@@ -67,9 +65,14 @@ async fn main() -> Result<()> {
     let max_exp = config.registrar.max_expires;
     let def_exp = config.registrar.default_expires;
     let nonce_ttl = config.registrar.nonce_ttl_s;
+    let push_bearer = config
+        .push
+        .auth_bearer_env
+        .as_deref()
+        .and_then(|name| std::env::var(name).ok());
     let udp_cfg = udp::UdpProxyConfig {
         domain: domain_cfg,
-        advertise,
+        advertise: advertise.clone(),
         sip_port,
         max_forwards: mf,
         registrar: udp::RegistrarLimits {
@@ -81,10 +84,30 @@ async fn main() -> Result<()> {
         fork_parallel: config.proxy.fork_parallel,
         pg,
         stir: build_stir_config(&config.stir),
+        max_message_bytes: config.transport.max_message_bytes,
+        outbound_edge_uri: config.registrar.outbound_edge_uri.clone(),
+        push_gateway_url: config.push.gateway_url.clone(),
+        push_timeout_ms: config.push.timeout_ms,
+        push_auth_bearer: push_bearer,
+        push_device_idle_secs: config.push.device_idle_secs,
+        http_client: reqwest::Client::new(),
     };
     let forward_table = forward_table::new_forward_table();
     let dialog_table = dialog::new_dialog_table();
     let transaction_table = udp::new_transaction_table();
+    let ws_listen = config.proxy.ws_listen_port;
+    let ws_table_opt = (ws_listen != 0).then(sipora_edge::ws_table::new_ws_connection_table);
+    let ws_for_udp = ws_table_opt.clone();
+    let shutdown_for_ws = (ws_listen != 0).then(|| shutdown_rx.clone());
+    let (ws_ingress_tx, ws_ingress_rx) = if ws_listen != 0 {
+        let (t, r) = mpsc::channel(sipora_edge::ws_table::WS_OUTBOUND_QUEUE);
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
+    let max_msg = config.transport.max_message_bytes;
+    let (tcp_ingress_tx, tcp_ingress_rx) = mpsc::channel(256);
+    let tcp_pool = Arc::new(TcpConnectionPool::new(tcp_ingress_tx, max_msg));
     tokio::spawn(async move {
         if let Err(e) = udp::run_udp_proxy(
             sip_addr,
@@ -93,6 +116,10 @@ async fn main() -> Result<()> {
             forward_table,
             dialog_table,
             transaction_table,
+            ws_for_udp,
+            ws_ingress_rx,
+            Some(tcp_pool),
+            Some(tcp_ingress_rx),
             shutdown_rx,
         )
         .await
@@ -101,8 +128,27 @@ async fn main() -> Result<()> {
         }
     });
 
+    if let (Some(shutdown_ws), Some(ws_table)) = (shutdown_for_ws, ws_table_opt) {
+        let ws_addr = SocketAddr::from(([0, 0, 0, 0], ws_listen));
+        let adv = advertise.clone();
+        let ing = ws_ingress_tx;
+        tokio::spawn(async move {
+            if let Err(e) =
+                proxy_ws::run_proxy_ws_listener(ws_addr, adv, ws_listen, ws_table, ing, shutdown_ws)
+                    .await
+            {
+                tracing::error!("proxy WebSocket listener: {e}");
+            }
+        });
+    }
+
     ready.set_ready(true);
-    tracing::info!(udp = %sip_addr, health = %health_addr, "sipora-proxy listening");
+    tracing::info!(
+        udp = %sip_addr,
+        ws = ws_listen,
+        health = %health_addr,
+        "sipora-proxy listening"
+    );
 
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(true);

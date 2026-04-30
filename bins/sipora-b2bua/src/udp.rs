@@ -2,6 +2,7 @@ use crate::call::B2buaCallStore;
 use crate::codec::CodecPolicy;
 use crate::routing::ProxyRouter;
 use sipora_auth::stir::{AttestLevel, identity_header_value, sign_passport};
+use sipora_media::rtpengine::RtpEnginePolicy;
 use sipora_sip::parser::message::parse_sip_message;
 use sipora_sip::serialize::serialize_message;
 use sipora_sip::types::header::{Header, NameAddr, Transport, Via};
@@ -33,6 +34,8 @@ pub struct B2buaUdpRuntime {
     pub advertise: String,
     pub sip_port: u16,
     pub policy: CodecPolicy,
+    /// rtpengine ng ICE/DTLS flags for future `offer`/`answer` integration (`[media].rtpengine_*`).
+    pub rtp_engine_policy: RtpEnginePolicy,
     pub router: ProxyRouter,
     /// If set, sign every outbound INVITE with a STIR PASSporT.
     pub stir: Option<B2buaStirConfig>,
@@ -187,7 +190,9 @@ async fn forward_invite(
         tracing::debug!(
             ice_capable = media_profile.is_ice_capable,
             dtls_srtp = media_profile.has_dtls_srtp,
-            "b2bua: observed SDP media profile for future rtpengine integration"
+            rtpengine_ice = ?rt.rtp_engine_policy.ice,
+            rtpengine_dtls = ?rt.rtp_engine_policy.dtls,
+            "b2bua: SDP profile and rtpengine policy for ng offer/answer (rtpengine_host wiring pending)"
         );
         let (new_sdp, removed) = rt.policy.filter_sdp_codecs(s);
         if !removed.is_empty() {

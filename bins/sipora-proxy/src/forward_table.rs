@@ -8,9 +8,18 @@ use tokio::sync::{RwLock, watch};
 
 const PENDING_FORWARD_TTL: Duration = Duration::from_secs(32);
 
+/// Where to send a proxied SIP response (UDP peer or WebSocket connection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseTarget {
+    Udp(SocketAddr),
+    Ws { connection_id: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingForward {
     pub client_addr: SocketAddr,
+    /// When set, SIP responses for this branch go out over WebSocket instead of UDP.
+    pub reply_ws_conn_id: Option<String>,
     pub target_addr: SocketAddr,
     pub original_via_stack: Vec<Via>,
     pub original_request: Option<Request>,
@@ -21,6 +30,8 @@ pub struct PendingForward {
     pub inserted_at: Instant,
     /// Last `RSeq` from a relayed reliable 1xx on this fork (RFC 3262 PRACK routing).
     pub last_reliable_rseq: Option<u32>,
+    /// Last `(rseq, cseq)` PRACK forwarded downstream (suppress duplicate PRACK retransmits).
+    pub last_prack_rack: Option<(u32, u32)>,
 }
 
 pub type ForwardTable = Arc<RwLock<HashMap<String, PendingForward>>>;
@@ -104,6 +115,7 @@ pub async fn insert_forward(
     table: &ForwardTable,
     branch: String,
     client_addr: SocketAddr,
+    reply_ws_conn_id: Option<String>,
     target_addr: SocketAddr,
     original_via_stack: Vec<Via>,
     original_request: Option<Request>,
@@ -112,6 +124,7 @@ pub async fn insert_forward(
 ) -> Option<PendingForward> {
     let pending = PendingForward {
         client_addr,
+        reply_ws_conn_id,
         target_addr,
         original_via_stack,
         original_request,
@@ -120,6 +133,7 @@ pub async fn insert_forward(
         final_forwarded: false,
         inserted_at: Instant::now(),
         last_reliable_rseq: None,
+        last_prack_rack: None,
     };
     let prev = table.write().await.insert(branch.clone(), pending);
     if prev.is_some() {
@@ -139,7 +153,7 @@ pub async fn prepare_response(
     table: &ForwardTable,
     branch: &str,
     response: &mut Response,
-) -> Option<SocketAddr> {
+) -> Option<ResponseTarget> {
     let mut forwards = table.write().await;
     let pending = forwards.get_mut(branch)?;
 
@@ -147,6 +161,9 @@ pub async fn prepare_response(
         Header::RSeq(n) => Some(*n),
         _ => None,
     }) {
+        if pending.last_reliable_rseq == Some(rseq) {
+            return None;
+        }
         pending.last_reliable_rseq = Some(rseq);
     }
 
@@ -156,11 +173,17 @@ pub async fn prepare_response(
         pending.final_forwarded = true;
     }
 
-    let client_addr = pending.client_addr;
+    let target = if let Some(ref id) = pending.reply_ws_conn_id {
+        ResponseTarget::Ws {
+            connection_id: id.clone(),
+        }
+    } else {
+        ResponseTarget::Udp(pending.client_addr)
+    };
     if response.status.class() >= 3 {
         forwards.remove(branch);
     }
-    Some(client_addr)
+    Some(target)
 }
 
 pub async fn sweep_expired_forwards(table: &ForwardTable) {
@@ -293,6 +316,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -304,7 +328,7 @@ mod tests {
 
         let target = prepare_response(&table, "z9hG4bK-proxy", &mut response).await;
 
-        assert_eq!(target, Some(client_addr));
+        assert_eq!(target, Some(ResponseTarget::Udp(client_addr)));
         assert!(matches!(response.headers[0], Header::Via(_)));
         assert!(table.read().await["z9hG4bK-proxy"].final_forwarded);
     }
@@ -317,6 +341,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -330,7 +355,7 @@ mod tests {
         prepare_response(&table, "z9hG4bK-proxy", &mut first).await;
         let target = prepare_response(&table, "z9hG4bK-proxy", &mut second).await;
 
-        assert_eq!(target, Some(client_addr));
+        assert_eq!(target, Some(ResponseTarget::Udp(client_addr)));
         assert!(matches!(second.headers[0], Header::Via(_)));
     }
 
@@ -342,6 +367,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -353,7 +379,7 @@ mod tests {
 
         let target = prepare_response(&table, "z9hG4bK-proxy", &mut response).await;
 
-        assert_eq!(target, Some(client_addr));
+        assert_eq!(target, Some(ResponseTarget::Udp(client_addr)));
         assert!(table.read().await.is_empty());
     }
 
@@ -394,6 +420,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -405,7 +432,7 @@ mod tests {
 
         let target = prepare_response(&table, "z9hG4bK-proxy", &mut resp).await;
 
-        assert_eq!(target, Some(client_addr));
+        assert_eq!(target, Some(ResponseTarget::Udp(client_addr)));
         assert!(table.read().await.is_empty());
     }
 
@@ -421,6 +448,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_owned(),
             client_addr,
+            None,
             client_addr,
             stack,
             None,
@@ -443,6 +471,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_reliable_provisional_skips_second_prepare() {
+        let table = new_forward_table();
+        let client_addr = "127.0.0.1:5060".parse().unwrap();
+        insert_forward(
+            &table,
+            "z9hG4bK-proxy".to_owned(),
+            client_addr,
+            None,
+            client_addr,
+            vec![],
+            None,
+            vec![],
+            "sip:bob@127.0.0.1:5060".to_owned(),
+        )
+        .await;
+        let mut first = response(StatusCode::SESSION_PROGRESS);
+        first.headers.push(Header::RSeq(7));
+        let mut second = first.clone();
+
+        assert!(
+            prepare_response(&table, "z9hG4bK-proxy", &mut first)
+                .await
+                .is_some()
+        );
+        assert!(
+            prepare_response(&table, "z9hG4bK-proxy", &mut second)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn provisional_response_forwards_without_final_forwarded() {
         let table = new_forward_table();
         let client_addr = "127.0.0.1:5060".parse().unwrap();
@@ -450,6 +510,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -461,7 +522,7 @@ mod tests {
 
         let target = prepare_response(&table, "z9hG4bK-proxy", &mut resp).await;
 
-        assert_eq!(target, Some(client_addr));
+        assert_eq!(target, Some(ResponseTarget::Udp(client_addr)));
         assert!(!table.read().await["z9hG4bK-proxy"].final_forwarded);
     }
 
@@ -473,6 +534,7 @@ mod tests {
             &table,
             "stale".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -489,6 +551,7 @@ mod tests {
             &table,
             "fresh".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             None,
@@ -514,6 +577,7 @@ mod tests {
                 &table,
                 "same-branch".to_owned(),
                 client_addr,
+                None,
                 client_addr,
                 vec![],
                 None,
@@ -527,6 +591,7 @@ mod tests {
             &table,
             "same-branch".to_owned(),
             client_addr,
+            None,
             other,
             vec![],
             None,
@@ -546,6 +611,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy-1".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             Some(invite_request_with_call_id("call-abc")),
@@ -557,6 +623,7 @@ mod tests {
             &table,
             "z9hG4bK-proxy-2".to_owned(),
             client_addr,
+            None,
             client_addr,
             vec![],
             Some(invite_request_with_call_id("call-xyz")),
