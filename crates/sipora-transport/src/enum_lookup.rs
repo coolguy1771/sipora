@@ -130,7 +130,7 @@ pub async fn enum_resolve_tel_to_sip(digits: &str) -> Option<String> {
         }
     }
 
-    naptrs.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    naptrs.sort_by_key(|a| (a.0, a.1, a.2));
     naptrs.into_iter().next().map(|(_, _, _, uri)| uri)
 }
 
