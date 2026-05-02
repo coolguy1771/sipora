@@ -5,6 +5,7 @@ use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::io::Cursor;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
@@ -52,6 +53,8 @@ pub enum StirError {
     UnknownAttest(String),
     #[error("signing failed: {0}")]
     SignError(String),
+    #[error("certificate chain verification failed: {0}")]
+    ChainInvalid(String),
 }
 
 // PASSporT JWT claims (RFC 8225 §5).
@@ -121,7 +124,11 @@ impl CertCache {
             .text()
             .await
             .map_err(|e| StirError::CertFetch(e.to_string()))?;
-        let _spki = spki_pem_from_cert_pem(&pem)?;
+        let ders = read_pem_certificate_ders(&pem)?;
+        let leaf = ders
+            .first()
+            .ok_or_else(|| StirError::CertParse("empty certificate PEM".into()))?;
+        let _spki = spki_pem_from_cert_der(leaf)?;
         self.inner.insert(url.to_owned(), pem.clone()).await;
         Ok(pem)
     }
@@ -180,12 +187,11 @@ fn parse_identity_header(value: &str) -> Result<(String, String), StirError> {
 /// Extract the SubjectPublicKeyInfo from a PEM-encoded X.509 certificate and
 /// re-encode it as a `-----BEGIN PUBLIC KEY-----` PEM string suitable for
 /// `jsonwebtoken::DecodingKey::from_ec_pem`.
-fn spki_pem_from_cert_pem(cert_pem: &str) -> Result<String, StirError> {
+fn spki_pem_from_cert_der(cert_der: &[u8]) -> Result<String, StirError> {
     use x509_cert::Certificate;
-    use x509_cert::der::{DecodePem, Encode};
+    use x509_cert::der::{Decode, Encode};
 
-    let cert = Certificate::from_pem(cert_pem.as_bytes())
-        .map_err(|e| StirError::CertParse(e.to_string()))?;
+    let cert = Certificate::from_der(cert_der).map_err(|e| StirError::CertParse(e.to_string()))?;
 
     let spki_der = cert
         .tbs_certificate
@@ -199,6 +205,118 @@ fn spki_pem_from_cert_pem(cert_pem: &str) -> Result<String, StirError> {
     ))
 }
 
+fn spki_pem_from_cert_pem(cert_pem: &str) -> Result<String, StirError> {
+    let ders = read_pem_certificate_ders(cert_pem)?;
+    let leaf = ders
+        .first()
+        .ok_or_else(|| StirError::CertParse("empty PEM".into()))?;
+    spki_pem_from_cert_der(leaf)
+}
+
+fn read_pem_certificate_ders(pem: &str) -> Result<Vec<Vec<u8>>, StirError> {
+    let mut rd = Cursor::new(pem.as_bytes());
+    rustls_pemfile::certs(&mut rd)
+        .map(|r| {
+            r.map(|c| c.as_ref().to_vec())
+                .map_err(|e| StirError::CertParse(format!("PEM certificates: {e}")))
+        })
+        .collect()
+}
+
+const MAX_STIR_CHAIN_DEPTH: usize = 16;
+
+fn cert_valid_now_x509(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<(), StirError> {
+    use x509_parser::time::ASN1Time;
+
+    let now = ASN1Time::now();
+    let v = cert.validity();
+    if v.not_before > now || v.not_after < now {
+        return Err(StirError::ChainInvalid(
+            "certificate outside validity period".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_signed_by_anchor(
+    cur: &x509_parser::certificate::X509Certificate<'_>,
+    anchor: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<(), StirError> {
+    cur.verify_signature(Some(anchor.public_key()))
+        .map_err(|e| StirError::ChainInvalid(format!("signed-by-anchor verification: {e}")))?;
+    anchor
+        .verify_signature(None)
+        .map_err(|e| StirError::ChainInvalid(format!("trust anchor self-signature: {e}")))?;
+    Ok(())
+}
+
+fn verify_chain_to_trust_anchors(chain: &[Vec<u8>], anchors: &[Vec<u8>]) -> Result<(), StirError> {
+    use x509_parser::certificate::X509Certificate;
+    use x509_parser::prelude::FromDer;
+
+    if chain.is_empty() {
+        return Err(StirError::CertParse(
+            "no certificates in Identity cert PEM".into(),
+        ));
+    }
+    if anchors.is_empty() {
+        return Err(StirError::CertParse(
+            "no STIR trust anchor certificates".into(),
+        ));
+    }
+
+    let mut idx = 0usize;
+    for _ in 0..MAX_STIR_CHAIN_DEPTH {
+        let (_, cur) = X509Certificate::from_der(chain[idx].as_slice())
+            .map_err(|e| StirError::CertParse(e.to_string()))?;
+        cert_valid_now_x509(&cur)?;
+
+        for ader in anchors {
+            let (_, anchor) = X509Certificate::from_der(ader.as_slice())
+                .map_err(|e| StirError::CertParse(e.to_string()))?;
+            if anchor.subject() == cur.issuer() {
+                return verify_signed_by_anchor(&cur, &anchor);
+            }
+        }
+
+        let mut advanced = false;
+        if idx + 1 < chain.len() {
+            let (_, nxt) = X509Certificate::from_der(chain[idx + 1].as_slice())
+                .map_err(|e| StirError::CertParse(e.to_string()))?;
+            if nxt.subject() == cur.issuer() {
+                cur.verify_signature(Some(nxt.public_key()))
+                    .map_err(|e| StirError::ChainInvalid(format!("chain signature: {e}")))?;
+                idx += 1;
+                advanced = true;
+            }
+        }
+        if !advanced {
+            for (j, der) in chain.iter().enumerate().skip(idx + 1) {
+                let (_, issuer) = X509Certificate::from_der(der.as_slice())
+                    .map_err(|e| StirError::CertParse(e.to_string()))?;
+                if issuer.subject() == cur.issuer() {
+                    cur.verify_signature(Some(issuer.public_key()))
+                        .map_err(|e| StirError::ChainInvalid(format!("chain signature: {e}")))?;
+                    idx = j;
+                    advanced = true;
+                    break;
+                }
+            }
+        }
+        if advanced {
+            continue;
+        }
+
+        return Err(StirError::ChainInvalid(
+            "no issuer matching an intermediate or trust anchor".into(),
+        ));
+    }
+
+    Err(StirError::ChainInvalid("chain exceeded max depth".into()))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -210,13 +328,22 @@ fn now_secs() -> u64 {
 ///
 /// Fetches the cert from the `info=` URL, verifies the ES256 PASSporT JWT,
 /// and enforces the 60-second freshness window from RFC 8224 §3.
+///
+/// When `trust_anchor_pem` is set, enforces PKIX path validation of the fetched
+/// certificate chain to those anchors (RFC 8226 §5) before trusting the leaf SPKI.
 pub async fn verify_identity_header(
     identity_value: &str,
     cache: &CertCache,
+    trust_anchor_pem: Option<&str>,
 ) -> Result<StirResult, StirError> {
     let (token, cert_url) = parse_identity_header(identity_value)?;
 
     let cert_pem = cache.fetch_cert_pem(&cert_url).await?;
+    if let Some(anchors) = trust_anchor_pem {
+        let chain = read_pem_certificate_ders(&cert_pem)?;
+        let roots = read_pem_certificate_ders(anchors)?;
+        verify_chain_to_trust_anchors(&chain, &roots)?;
+    }
     let pubkey_pem = spki_pem_from_cert_pem(&cert_pem)?;
     let decoding_key = DecodingKey::from_ec_pem(pubkey_pem.as_bytes())
         .map_err(|e| StirError::CertParse(e.to_string()))?;
@@ -458,9 +585,91 @@ mod tests {
         let cache = CertCache::new();
         cache.insert_pem_for_test(cert_url, cert_pem).await;
 
-        let err = verify_identity_header(&identity, &cache)
+        let err = verify_identity_header(&identity, &cache, None)
             .await
             .expect_err("stale iat must be rejected");
         assert!(matches!(err, StirError::Stale));
+    }
+
+    #[tokio::test]
+    async fn stir_chain_accepts_leaf_signed_by_trusted_ca() {
+        use rcgen::{CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let ee_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let ee_params = CertificateParams::new(vec!["sip.stir.test".into()]).unwrap();
+        let ee_cert = ee_params.signed_by(&ee_key, &ca_cert, &ca_key).unwrap();
+
+        let chain_pem = format!("{}{}", ee_cert.pem(), ca_cert.pem());
+        let anchor_pem = ca_cert.pem();
+        let priv_pem = ee_key.serialize_pem();
+
+        let token = sign_passport(
+            "15551234567",
+            &["15557654321"],
+            AttestLevel::Full,
+            "oid",
+            priv_pem.as_bytes(),
+            "https://stir-chain.example/cert.pem",
+        )
+        .unwrap();
+        let identity = identity_header_value(&token, "https://stir-chain.example/cert.pem");
+        let cache = CertCache::new();
+        cache
+            .insert_pem_for_test("https://stir-chain.example/cert.pem", chain_pem)
+            .await;
+
+        let r = verify_identity_header(&identity, &cache, Some(anchor_pem.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(r.attest, AttestLevel::Full);
+    }
+
+    #[tokio::test]
+    async fn stir_chain_rejects_wrong_trust_anchor() {
+        use rcgen::{CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let ee_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let ee_params = CertificateParams::new(vec!["sip.stir.test".into()]).unwrap();
+        let ee_cert = ee_params.signed_by(&ee_key, &ca_cert, &ca_key).unwrap();
+
+        let chain_pem = format!("{}{}", ee_cert.pem(), ca_cert.pem());
+
+        let other_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let other_ca = CertificateParams::new(vec![])
+            .unwrap()
+            .self_signed(&other_key)
+            .unwrap();
+        let wrong_anchor_pem = other_ca.pem();
+        let priv_pem = ee_key.serialize_pem();
+
+        let token = sign_passport(
+            "15551234567",
+            &["15557654321"],
+            AttestLevel::Full,
+            "oid",
+            priv_pem.as_bytes(),
+            "https://stir-chain.example/cert.pem",
+        )
+        .unwrap();
+        let identity = identity_header_value(&token, "https://stir-chain.example/cert.pem");
+        let cache = CertCache::new();
+        cache
+            .insert_pem_for_test("https://stir-chain.example/cert.pem", chain_pem)
+            .await;
+
+        let err = verify_identity_header(&identity, &cache, Some(wrong_anchor_pem.as_str()))
+            .await
+            .expect_err("untrusted anchor must fail chain validation");
+        assert!(matches!(err, StirError::ChainInvalid(_)));
     }
 }

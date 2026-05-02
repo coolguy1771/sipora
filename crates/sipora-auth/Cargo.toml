@@ -27,6 +27,8 @@ sipora-core = { workspace = true }
 reqwest = { workspace = true }
 moka = { workspace = true }
 x509-cert = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { version = "0.18", features = ["verify"] }
 url = { workspace = true }
 
 [dev-dependencies]

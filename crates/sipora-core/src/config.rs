@@ -425,6 +425,10 @@ pub struct StirConfig {
     /// Attestation level the B2BUA can vouch for: "A" (full), "B" (partial), "C" (gateway).
     #[serde(default = "default_attest_level")]
     pub attest: String,
+    /// PEM file with one or more STI-CA / operator trust anchors for Identity cert chain
+    /// validation (RFC 8226 §5). Required when `mode` is `strict`.
+    #[serde(default)]
+    pub trust_anchor_pem_path: Option<String>,
 }
 
 impl Default for StirConfig {
@@ -435,6 +439,7 @@ impl Default for StirConfig {
             privkey_pem_path: None,
             cert_url: None,
             attest: default_attest_level(),
+            trust_anchor_pem_path: None,
         }
     }
 }
@@ -473,12 +478,34 @@ impl StirConfig {
                 "[stir].cert_url is required when [stir].privkey_pem_path is set".into(),
             ));
         }
+        if mode == "strict" {
+            let path = self
+                .trust_anchor_pem_path
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let Some(path) = path else {
+                return Err(config::ConfigError::Message(
+                    "[stir].trust_anchor_pem_path is required when [stir].mode=strict".into(),
+                ));
+            };
+            if !std::path::Path::new(path).is_file() {
+                return Err(config::ConfigError::Message(format!(
+                    "[stir].trust_anchor_pem_path must be an existing file (got {path:?})"
+                )));
+            }
+        }
         Ok(StirConfig {
             mode,
             trusted_peer_ips: self.trusted_peer_ips.clone(),
             privkey_pem_path: self.privkey_pem_path.clone(),
             cert_url: self.cert_url.clone(),
             attest,
+            trust_anchor_pem_path: self
+                .trust_anchor_pem_path
+                .as_ref()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

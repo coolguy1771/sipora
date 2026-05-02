@@ -61,6 +61,14 @@ impl TransactionManager {
         Some(entry)
     }
 
+    /// Remove a client transaction without aborting its retransmit task.
+    ///
+    /// Used when the INVITE retransmit task hits Timer B (RFC 3261 §17.1.1.2): the task
+    /// must clear its own map entry without calling `abort` on its own `AbortHandle`.
+    pub fn remove_quiet(&mut self, key: &TransactionKey) -> Option<TransactionEntry> {
+        self.transactions.remove(key)
+    }
+
     pub fn has_transaction(&self, key: &TransactionKey) -> bool {
         self.find(key).is_some()
     }

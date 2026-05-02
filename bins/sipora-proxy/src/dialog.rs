@@ -8,13 +8,14 @@
 //! Successful BYE forwarding removes the entry immediately via [`remove_dialog`].
 
 use moka::sync::Cache;
-use sipora_sip::types::header::Header;
+use sipora_sip::types::header::{Header, NameAddr, Refresher};
 use sipora_sip::types::message::{Request, Response};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 /// Max dialog rows kept in memory before LRU eviction.
 pub const DEFAULT_DIALOG_TABLE_MAX_ENTRIES: u64 = 50_000;
@@ -45,10 +46,15 @@ impl DialogKey {
 pub struct DialogState {
     pub route_set: Vec<String>,
     pub remote_target: String,
+    pub from_party: NameAddr,
+    pub to_party: NameAddr,
     pub cseq: u32,
     pub caller_addr: SocketAddr,
     pub callee_addr: SocketAddr,
+    /// When the INVITE arrived over WebSocket, BYE toward the caller uses this connection.
+    pub caller_reply_ws: Option<String>,
     pub session_expires: Option<u32>,
+    pub session_refresher: Option<Refresher>,
 }
 
 pub type DialogTable = Arc<Cache<DialogKey, DialogState>>;
@@ -69,19 +75,25 @@ pub fn new_refresh_table() -> RefreshTable {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Spawns a guard that removes the dialog after `session_expires` seconds if no refresh arrives.
+/// Spawns a guard that notifies the UDP run loop after `sleep_for` when the session interval elapses.
 pub async fn spawn_session_guard(
     dialog_table: &DialogTable,
     refresh_table: &RefreshTable,
     key: DialogKey,
-    session_expires: u32,
+    sleep_for: Duration,
+    expired_tx: mpsc::Sender<DialogKey>,
 ) {
     let dialog_table = Arc::clone(dialog_table);
     let key_for_task = key.clone();
     let handle = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(session_expires as u64)).await;
-        tracing::warn!(call_id = %key_for_task.call_id, "session timer expired — removing zombie dialog");
-        dialog_table.invalidate(&key_for_task);
+        tokio::time::sleep(sleep_for).await;
+        tracing::warn!(
+            call_id = %key_for_task.call_id,
+            "session timer expired — requesting BYE teardown"
+        );
+        if expired_tx.send(key_for_task.clone()).await.is_err() {
+            dialog_table.invalidate(&key_for_task);
+        }
     });
     let mut guard = refresh_table.lock().await;
     if let Some(prev) = guard.insert(key, handle.abort_handle()) {
@@ -106,19 +118,40 @@ pub async fn insert_dialog_from_response(
     response: &Response,
     caller_addr: SocketAddr,
     callee_addr: SocketAddr,
+    caller_reply_ws: Option<String>,
 ) -> Option<DialogKey> {
     let key = response_dialog_key(response)?;
-    let session_expires = response.headers.iter().find_map(|h| match h {
-        Header::SessionExpires { delta_seconds, .. } => Some(*delta_seconds),
+    let (session_expires, session_refresher) = response
+        .headers
+        .iter()
+        .find_map(|h| match h {
+            Header::SessionExpires {
+                delta_seconds,
+                refresher,
+            } => Some((*delta_seconds, *refresher)),
+            _ => None,
+        })
+        .map(|(d, r)| (Some(d), r))
+        .unwrap_or((None, None));
+    let from_party = response.headers.iter().find_map(|h| match h {
+        Header::From(na) => Some(na.clone()),
         _ => None,
-    });
+    })?;
+    let to_party = response.headers.iter().find_map(|h| match h {
+        Header::To(na) => Some(na.clone()),
+        _ => None,
+    })?;
     let state = DialogState {
         route_set: response_route_set(response),
         remote_target: response_remote_target(response)?,
+        from_party,
+        to_party,
         cseq: response.cseq()?.seq,
         caller_addr,
         callee_addr,
+        caller_reply_ws,
         session_expires,
+        session_refresher,
     };
     table.insert(key.clone(), state);
     Some(key)
@@ -195,7 +228,7 @@ fn to_tag(header: &Header) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sipora_sip::types::header::{CSeq, ContactValue, NameAddr};
+    use sipora_sip::types::header::{CSeq, ContactValue, NameAddr, Refresher};
     use sipora_sip::types::message::SipVersion;
     use sipora_sip::types::method::Method;
     use sipora_sip::types::status::StatusCode;
@@ -206,7 +239,7 @@ mod tests {
         let caller = "127.0.0.1:5060".parse().unwrap();
         let callee = "127.0.0.1:5070".parse().unwrap();
 
-        let key = insert_dialog_from_response(&table, &success_response(), caller, callee)
+        let key = insert_dialog_from_response(&table, &success_response(), caller, callee, None)
             .await
             .unwrap();
 
@@ -217,6 +250,27 @@ mod tests {
         assert_eq!(state.caller_addr, caller);
         assert_eq!(state.callee_addr, callee);
         assert_eq!(state.session_expires, None);
+        assert_eq!(state.session_refresher, None);
+        assert_eq!(state.from_party.uri, "sip:alice@example.com");
+        assert_eq!(state.to_party.uri, "sip:bob@example.com");
+    }
+
+    #[tokio::test]
+    async fn stores_session_expires_refresher_from_response() {
+        let table = new_dialog_table();
+        let caller = "127.0.0.1:5060".parse().unwrap();
+        let callee = "127.0.0.1:5070".parse().unwrap();
+        let mut resp = success_response();
+        resp.headers.push(Header::SessionExpires {
+            delta_seconds: 90,
+            refresher: Some(Refresher::Uac),
+        });
+        let key = insert_dialog_from_response(&table, &resp, caller, callee, None)
+            .await
+            .unwrap();
+        let state = table.get(&key).expect("dialog present");
+        assert_eq!(state.session_expires, Some(90));
+        assert_eq!(state.session_refresher, Some(Refresher::Uac));
     }
 
     fn success_response() -> Response {

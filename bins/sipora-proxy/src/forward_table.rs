@@ -149,6 +149,11 @@ pub async fn get_pending_forward(table: &ForwardTable, branch: &str) -> Option<P
     table.read().await.get(branch).cloned()
 }
 
+/// Removes the pending forward for `branch`, if still present (e.g. Timer B vs. final race).
+pub async fn remove_pending_branch(table: &ForwardTable, branch: &str) -> Option<PendingForward> {
+    table.write().await.remove(branch)
+}
+
 pub async fn prepare_response(
     table: &ForwardTable,
     branch: &str,

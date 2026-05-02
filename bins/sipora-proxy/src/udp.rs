@@ -26,7 +26,9 @@ use sipora_sip::parser::message::parse_sip_message;
 use sipora_sip::serialize::serialize_message;
 use sipora_sip::transaction::TransactionKey;
 use sipora_sip::transaction::manager::{TransactionManager, TransactionType};
-use sipora_sip::types::header::{ContactValue, Header, SubscriptionStateValue, Transport, Via};
+use sipora_sip::types::header::{
+    CSeq, ContactValue, Header, SubscriptionStateValue, Transport, Via,
+};
 use sipora_sip::types::message::{Request, Response, SipMessage, SipVersion};
 use sipora_sip::types::method::Method;
 use sipora_sip::types::status::StatusCode;
@@ -37,8 +39,8 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{RwLock, watch};
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, mpsc, watch};
 use uuid::Uuid;
 
 use crate::dialog::{
@@ -49,7 +51,7 @@ use crate::event_bodies::{presence_body_from_doc, reginfo_xml};
 use crate::forward_table::{
     ForwardTable, PendingForward, ResponseTarget, find_branch_by_call_id,
     find_branch_by_call_id_and_rseq, find_branches_by_call_id, get_pending_forward, insert_forward,
-    prepare_response, spawn_forward_sweeper,
+    prepare_response, remove_pending_branch, spawn_forward_sweeper,
 };
 use crate::ingress::ProxyIngress;
 use crate::message_sender::{MessageSender, MessageTarget};
@@ -82,6 +84,8 @@ pub struct StirConfig {
     /// Source IPs whose P-Asserted-Identity headers are trusted (RFC 3325 §9.1).
     pub trusted_peer_ips: Vec<IpAddr>,
     pub cert_cache: CertCache,
+    /// PEM bundle loaded from `[stir].trust_anchor_pem_path` (RFC 8226 §5 chain validation).
+    pub trust_anchor_pem: Option<Arc<str>>,
 }
 
 impl Default for StirConfig {
@@ -90,6 +94,7 @@ impl Default for StirConfig {
             mode: StirMode::Disabled,
             trusted_peer_ips: vec![],
             cert_cache: CertCache::new(),
+            trust_anchor_pem: None,
         }
     }
 }
@@ -115,6 +120,12 @@ pub struct UdpProxyConfig {
 }
 
 pub type TransactionTable = Arc<RwLock<TransactionManager>>;
+
+/// INVITE client Timer B (RFC 3261 §17.1.1.2). Uses production `TIMER_B` unless compiling tests.
+#[cfg(test)]
+const INVITE_CLIENT_TIMER_B: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const INVITE_CLIENT_TIMER_B: Duration = sipora_sip::transaction::TIMER_B;
 
 #[derive(Debug)]
 struct PreparedForkFailure {
@@ -224,6 +235,7 @@ async fn dispatch_merge_ingress_item(
     transaction_table: &TransactionTable,
     fork_table: &ForkTable,
     refresh_table: &RefreshTable,
+    session_expired_tx: mpsc::Sender<DialogKey>,
 ) -> anyhow::Result<()> {
     match item {
         MergeIngress::Ws(env) => {
@@ -261,6 +273,7 @@ async fn dispatch_merge_ingress_item(
                         dialog_table,
                         transaction_table,
                         refresh_table,
+                        session_expired_tx.clone(),
                         resp,
                     )
                     .await
@@ -301,6 +314,7 @@ async fn dispatch_merge_ingress_item(
                         dialog_table,
                         transaction_table,
                         refresh_table,
+                        session_expired_tx.clone(),
                         resp,
                     )
                     .await
@@ -342,6 +356,7 @@ pub async fn run_udp_proxy(
     let mut merged_rx = spawn_merge_ingress_bridges(ws_ingress, tcp_ingress);
     let router = ProxyRouter::new(cfg.max_forwards);
     let refresh_table = new_refresh_table();
+    let (session_expired_tx, mut session_expired_rx) = mpsc::channel::<DialogKey>(256);
     let fork_table = new_fork_table();
     let _forward_sweeper = spawn_forward_sweeper(forward_table.clone(), shutdown.clone());
     let _fork_sweeper =
@@ -353,6 +368,24 @@ pub async fn run_udp_proxy(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     return Ok(());
+                }
+            }
+            expired_key = session_expired_rx.recv() => {
+                let Some(k) = expired_key else {
+                    return Ok(());
+                };
+                if let Err(e) = handle_session_expired(
+                    k,
+                    &socket,
+                    &sip_sender,
+                    &redis,
+                    &cfg,
+                    &dialog_table,
+                    &refresh_table,
+                )
+                .await
+                {
+                    tracing::warn!(%e, "session-expired teardown");
                 }
             }
             recv = socket.recv_from(&mut buf) => {
@@ -390,6 +423,7 @@ pub async fn run_udp_proxy(
                             &dialog_table,
                             &transaction_table,
                             &refresh_table,
+                            session_expired_tx.clone(),
                             resp,
                         )
                         .await
@@ -419,6 +453,7 @@ pub async fn run_udp_proxy(
                     &transaction_table,
                     &fork_table,
                     &refresh_table,
+                    session_expired_tx.clone(),
                 )
                 .await;
                 if let Err(e) = result {
@@ -454,6 +489,7 @@ async fn dispatch_request(
         Method::Invite => {
             handle_invite(
                 ingress,
+                sip_sender,
                 redis,
                 router,
                 cfg,
@@ -602,6 +638,7 @@ async fn dispatch_response(
     dialog_table: &DialogTable,
     transaction_table: &TransactionTable,
     refresh_table: &RefreshTable,
+    session_expired_tx: mpsc::Sender<DialogKey>,
     resp: Response,
 ) -> anyhow::Result<()> {
     let Some(branch) = response_proxy_branch(&resp, cfg) else {
@@ -623,6 +660,7 @@ async fn dispatch_response(
             dialog_table,
             transaction_table,
             refresh_table,
+            session_expired_tx,
             branch,
             resp,
             pending,
@@ -653,6 +691,7 @@ async fn dispatch_response(
         dialog_table,
         refresh_table,
         forward_table,
+        session_expired_tx,
         &branch,
         resp,
         pending,
@@ -689,6 +728,7 @@ async fn handle_parallel_response(
     dialog_table: &DialogTable,
     transaction_table: &TransactionTable,
     refresh_table: &RefreshTable,
+    session_expired_tx: mpsc::Sender<DialogKey>,
     branch: String,
     resp: Response,
     pending: Option<PendingForward>,
@@ -700,6 +740,7 @@ async fn handle_parallel_response(
             dialog_table,
             refresh_table,
             forward_table,
+            session_expired_tx.clone(),
             &branch,
             resp,
             pending,
@@ -714,6 +755,7 @@ async fn handle_parallel_response(
             dialog_table,
             refresh_table,
             forward_table,
+            session_expired_tx.clone(),
             &branch,
             resp,
             pending,
@@ -741,6 +783,7 @@ async fn handle_parallel_response(
             dialog_table,
             refresh_table,
             forward_table,
+            session_expired_tx,
             &branch,
             resp,
             pending,
@@ -757,6 +800,7 @@ async fn relay_parallel_response(
     dialog_table: &DialogTable,
     refresh_table: &RefreshTable,
     forward_table: &ForwardTable,
+    session_expired_tx: mpsc::Sender<DialogKey>,
     branch: &str,
     resp: Response,
     pending: Option<PendingForward>,
@@ -767,6 +811,7 @@ async fn relay_parallel_response(
         dialog_table,
         refresh_table,
         forward_table,
+        session_expired_tx,
         branch,
         resp,
         pending,
@@ -1001,7 +1046,16 @@ async fn handle_fork_failure_response(
     let Some(mut target) = prepare_response(forward_table, branch, &mut resp).await else {
         return Ok(());
     };
-    if forward_next_fork(socket, cfg, forward_table, transaction_table, pending).await? {
+    if forward_next_fork(
+        socket,
+        sip_sender,
+        cfg,
+        forward_table,
+        transaction_table,
+        pending,
+    )
+    .await?
+    {
         return Ok(());
     }
     if let Some(via) = response_top_via(&resp) {
@@ -1020,6 +1074,7 @@ async fn relay_final_response(
     dialog_table: &DialogTable,
     refresh_table: &RefreshTable,
     forward_table: &ForwardTable,
+    session_expired_tx: mpsc::Sender<DialogKey>,
     branch: &str,
     mut resp: Response,
     pending: Option<PendingForward>,
@@ -1034,20 +1089,26 @@ async fn relay_final_response(
             w @ ResponseTarget::Ws { .. } => w,
         };
     }
-    if success_response && let Some(pending) = pending {
-        let session_expires = response_session_expires(&resp);
-        if let (Some(dialog_key), Some(se)) = (
-            insert_dialog_from_response(
-                dialog_table,
-                &resp,
-                pending.client_addr,
-                pending.target_addr,
-            )
-            .await,
-            session_expires,
-        ) {
-            spawn_session_guard(dialog_table, refresh_table, dialog_key, se).await;
-        }
+    if success_response
+        && let Some(pending) = pending
+        && let Some(dialog_key) = insert_dialog_from_response(
+            dialog_table,
+            &resp,
+            pending.client_addr,
+            pending.target_addr,
+            pending.reply_ws_conn_id.clone(),
+        )
+        .await
+        && let Some(se) = response_session_expires(&resp)
+    {
+        spawn_session_guard(
+            dialog_table,
+            refresh_table,
+            dialog_key,
+            Duration::from_secs(se as u64),
+            session_expired_tx.clone(),
+        )
+        .await;
     }
     send_response_target(socket, sip_sender, resp, target).await
 }
@@ -1097,6 +1158,7 @@ fn should_try_next_fork(resp: &Response, pending: Option<&PendingForward>) -> bo
 
 async fn forward_next_fork(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     cfg: &UdpProxyConfig,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
@@ -1117,6 +1179,7 @@ async fn forward_next_fork(
             .collect();
         forward_invite_request(
             socket,
+            sip_sender,
             forward_table,
             transaction_table,
             pending.client_addr,
@@ -1257,6 +1320,85 @@ fn next_route_uri(headers: &[Header]) -> Option<String> {
 
 fn strip_name_addr(uri: &str) -> &str {
     uri.trim().trim_start_matches('<').trim_end_matches('>')
+}
+
+fn build_dialog_bye_for_uri(state: &DialogState, key: &DialogKey, request_uri: &str) -> Request {
+    let mut headers = Vec::new();
+    if !state.route_set.is_empty() {
+        headers.push(Header::Route(state.route_set.clone()));
+    }
+    headers.push(Header::From(state.from_party.clone()));
+    headers.push(Header::To(state.to_party.clone()));
+    headers.push(Header::CallId(key.call_id.clone()));
+    let bye_seq = state.cseq.saturating_add(1);
+    headers.push(Header::CSeq(CSeq {
+        seq: bye_seq,
+        method: Method::Bye,
+    }));
+    headers.push(Header::MaxForwards(70));
+    headers.push(Header::ContentLength(0));
+    Request {
+        method: Method::Bye,
+        uri: request_uri.to_string(),
+        version: SipVersion::V2_0,
+        headers,
+        body: Vec::new(),
+    }
+}
+
+async fn send_session_expired_teardown(
+    socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
+    cfg: &UdpProxyConfig,
+    state: &DialogState,
+    key: &DialogKey,
+) -> anyhow::Result<()> {
+    let callee_uri = strip_name_addr(&state.remote_target).to_string();
+    let caller_uri = strip_name_addr(&state.from_party.uri).to_string();
+    let mut bye_callee = build_dialog_bye_for_uri(state, key, &callee_uri);
+    let _ = prepend_proxy_via(&mut bye_callee, &cfg.advertise, cfg.sip_port);
+    let b_callee = serialize_message(&SipMessage::Request(bye_callee));
+    socket.send_to(&b_callee, state.callee_addr).await?;
+
+    let mut bye_caller = build_dialog_bye_for_uri(state, key, &caller_uri);
+    let _ = prepend_proxy_via(&mut bye_caller, &cfg.advertise, cfg.sip_port);
+    match &state.caller_reply_ws {
+        Some(conn_id) => {
+            sip_sender
+                .send_sip(
+                    &MessageTarget::Ws {
+                        connection_id: conn_id.clone(),
+                    },
+                    SipMessage::Request(bye_caller),
+                )
+                .await?;
+        }
+        None => {
+            let b = serialize_message(&SipMessage::Request(bye_caller));
+            socket.send_to(&b, state.caller_addr).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_session_expired(
+    key: DialogKey,
+    socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
+    redis: &RedisPool,
+    cfg: &UdpProxyConfig,
+    dialog_table: &DialogTable,
+    refresh_table: &RefreshTable,
+) -> anyhow::Result<()> {
+    let Some(state) = dialog_table.get(&key) else {
+        return Ok(());
+    };
+    cancel_session_guard(refresh_table, &key).await;
+    send_session_expired_teardown(socket, sip_sender, cfg, &state, &key).await?;
+    let cid = key.call_id.clone();
+    let _ = crate::refer_state::delete_refer_state(redis, &cid).await;
+    remove_dialog(dialog_table, &key);
+    Ok(())
 }
 
 fn dialog_key_from_replaces_header(req: &Request) -> Option<DialogKey> {
@@ -1418,6 +1560,7 @@ async fn forward_dialog_request(
 #[allow(clippy::too_many_arguments)]
 async fn handle_invite(
     ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     pool: &RedisPool,
     router: &ProxyRouter,
     cfg: &UdpProxyConfig,
@@ -1450,6 +1593,7 @@ async fn handle_invite(
             };
             return forward_initial_invite(
                 ingress,
+                sip_sender,
                 Some(pool),
                 forward_table,
                 transaction_table,
@@ -1474,6 +1618,7 @@ async fn handle_invite(
 
     forward_initial_invite(
         ingress,
+        sip_sender,
         Some(pool),
         forward_table,
         transaction_table,
@@ -1700,6 +1845,7 @@ async fn maybe_push_wake_for_idle_contact(
 #[allow(clippy::too_many_arguments)]
 async fn forward_initial_invite(
     ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     pool: Option<&RedisPool>,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
@@ -1724,6 +1870,7 @@ async fn forward_initial_invite(
         let original_request = req.clone();
         forward_invite_request(
             &ingress.socket,
+            sip_sender,
             forward_table,
             transaction_table,
             ingress.source,
@@ -1743,6 +1890,7 @@ async fn forward_initial_invite(
 
     forward_parallel_initial_invite(
         ingress,
+        sip_sender,
         forward_table,
         transaction_table,
         fork_table,
@@ -1756,6 +1904,7 @@ async fn forward_initial_invite(
 #[allow(clippy::too_many_arguments)]
 async fn forward_parallel_initial_invite(
     ingress: &ProxyIngress,
+    sip_sender: &Arc<dyn MessageSender>,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     fork_table: &ForkTable,
@@ -1768,6 +1917,7 @@ async fn forward_parallel_initial_invite(
     let mut branches = Vec::new();
     let first_branch = forward_invite_request(
         &ingress.socket,
+        sip_sender,
         forward_table,
         transaction_table,
         ingress.source,
@@ -1788,6 +1938,7 @@ async fn forward_parallel_initial_invite(
         if let Some(target) = resolve_udp_target(&target_uri).await {
             let branch = forward_invite_request(
                 &ingress.socket,
+                sip_sender,
                 forward_table,
                 transaction_table,
                 ingress.source,
@@ -1883,6 +2034,7 @@ async fn select_initial_invite_target(
 #[allow(clippy::too_many_arguments)]
 async fn forward_invite_request(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
     forward_table: &ForwardTable,
     transaction_table: &TransactionTable,
     peer: SocketAddr,
@@ -1919,7 +2071,20 @@ async fn forward_invite_request(
 
     let bytes = serialize_message(&SipMessage::Request(req));
     socket.send_to(&bytes, target).await?;
-    let timer = spawn_invite_retransmit_timer(socket, bytes, target);
+    let timer = if let Some(ref k) = tx_key {
+        spawn_invite_retransmit_timer(
+            Arc::clone(socket),
+            Arc::clone(sip_sender),
+            Arc::clone(forward_table),
+            Arc::clone(transaction_table),
+            branch.clone(),
+            k.clone(),
+            bytes,
+            target,
+        )
+    } else {
+        tokio::spawn(async {})
+    };
     track_invite_client_transaction(transaction_table, tx_key, timer).await;
     Ok(branch)
 }
@@ -1951,21 +2116,93 @@ fn proxy_via(branch: &str, advertise: &str, sip_port: u16) -> Header {
     })
 }
 
-fn spawn_invite_retransmit_timer(
+async fn send_invite_timeout_response_to_client(
     socket: &Arc<tokio::net::UdpSocket>,
+    sip_sender: &Arc<dyn MessageSender>,
+    pending: &PendingForward,
+    resp: Response,
+) -> anyhow::Result<()> {
+    let mut target = if let Some(ref id) = pending.reply_ws_conn_id {
+        ResponseTarget::Ws {
+            connection_id: id.clone(),
+        }
+    } else {
+        ResponseTarget::Udp(pending.client_addr)
+    };
+    if let Some(via) = response_top_via(&resp) {
+        target = match target {
+            ResponseTarget::Udp(a) => ResponseTarget::Udp(response_relay_addr(via).unwrap_or(a)),
+            w @ ResponseTarget::Ws { .. } => w,
+        };
+    }
+    send_response_target(socket, sip_sender, resp, target).await
+}
+
+async fn finish_invite_client_timer_b(
+    socket: Arc<tokio::net::UdpSocket>,
+    sip_sender: Arc<dyn MessageSender>,
+    forward_table: ForwardTable,
+    transaction_table: TransactionTable,
+    branch: String,
+    tx_key: TransactionKey,
+) {
+    let pending = remove_pending_branch(&forward_table, &branch).await;
+    transaction_table.write().await.remove_quiet(&tx_key);
+    let Some(pending) = pending else {
+        return;
+    };
+    let Some(orig) = pending.original_request.as_ref() else {
+        return;
+    };
+    let SipMessage::Response(resp) = sip_response(orig, StatusCode::REQUEST_TIMEOUT) else {
+        return;
+    };
+    if let Err(e) =
+        send_invite_timeout_response_to_client(&socket, &sip_sender, &pending, resp).await
+    {
+        tracing::warn!(branch = %branch, "INVITE Timer B: send 408 to client failed: {e}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_invite_retransmit_timer(
+    socket: Arc<tokio::net::UdpSocket>,
+    sip_sender: Arc<dyn MessageSender>,
+    forward_table: ForwardTable,
+    transaction_table: TransactionTable,
+    branch: String,
+    tx_key: TransactionKey,
     bytes: Vec<u8>,
     target: SocketAddr,
 ) -> tokio::task::JoinHandle<()> {
-    let socket = Arc::clone(socket);
     tokio::spawn(async move {
+        let deadline = Instant::now() + INVITE_CLIENT_TIMER_B;
         let mut delay = sipora_sip::transaction::TIMER_T1;
         loop {
-            tokio::time::sleep(delay).await;
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let sleep_for = delay.min(deadline.saturating_duration_since(now));
+            tokio::time::sleep(sleep_for).await;
+            if Instant::now() >= deadline {
+                break;
+            }
             if socket.send_to(&bytes, target).await.is_err() {
+                transaction_table.write().await.remove_quiet(&tx_key);
                 return;
             }
             delay = (delay * 2).min(sipora_sip::transaction::TIMER_T2);
         }
+        finish_invite_client_timer_b(
+            socket,
+            sip_sender,
+            forward_table,
+            transaction_table,
+            branch,
+            tx_key,
+        )
+        .await;
     })
 }
 
@@ -2460,6 +2697,7 @@ async fn replay_push_pending_invites_after_register(
         };
         if let Err(e) = handle_invite(
             &ing,
+            &sip_sender,
             redis,
             router,
             cfg,
@@ -3253,7 +3491,13 @@ async fn check_stir_identity(req: &mut Request, cfg: &StirConfig) -> Option<Stat
         Some(v) => v,
     };
 
-    match verify_identity_header(&identity_val, &cfg.cert_cache).await {
+    match verify_identity_header(
+        &identity_val,
+        &cfg.cert_cache,
+        cfg.trust_anchor_pem.as_deref(),
+    )
+    .await
+    {
         Ok(result) => {
             tracing::debug!(
                 attest = ?result.attest,
@@ -3265,7 +3509,9 @@ async fn check_stir_identity(req: &mut Request, cfg: &StirConfig) -> Option<Stat
         }
         Err(e) => {
             let code = match &e {
-                StirError::CertFetch(_) | StirError::CertParse(_) => StatusCode::BAD_IDENTITY_INFO,
+                StirError::CertFetch(_) | StirError::CertParse(_) | StirError::ChainInvalid(_) => {
+                    StatusCode::BAD_IDENTITY_INFO
+                }
                 _ => StatusCode::INVALID_IDENTITY_HEADER,
             };
             tracing::warn!(%e, "STIR verification failed");
@@ -4083,6 +4329,11 @@ mod tests {
         Arc::new(UdpSender::new(sock.clone()))
     }
 
+    fn test_session_tx() -> mpsc::Sender<DialogKey> {
+        let (tx, _rx) = mpsc::channel::<DialogKey>(8);
+        tx
+    }
+
     #[test]
     fn parse_sip_user_host_accepts_ipv6_literal_without_user() {
         let parsed = parse_sip_user_host("sip:[2001:db8::1]:5070");
@@ -4418,8 +4669,10 @@ mod tests {
         let table = new_forward_table();
         let transaction_table = new_transaction_table();
 
+        let sip = test_sip_sender(&socket);
         forward_invite_request(
             &socket,
+            &sip,
             &table,
             &transaction_table,
             peer,
@@ -4461,8 +4714,10 @@ mod tests {
         let transaction_table = new_transaction_table();
         let path = vec!["<sip:edge.example.com;lr>".to_string()];
 
+        let sip = test_sip_sender(&socket);
         forward_invite_request(
             &socket,
+            &sip,
             &table,
             &transaction_table,
             peer,
@@ -4490,6 +4745,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invite_timer_b_sends_408_and_clears_pending() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let table = new_forward_table();
+        let transaction_table = new_transaction_table();
+        let sip = test_sip_sender(&socket);
+        let orig = invite_request();
+
+        forward_invite_request(
+            &socket,
+            &sip,
+            &table,
+            &transaction_table,
+            peer,
+            orig.clone(),
+            format!("sip:bob@{target_addr}"),
+            target_addr,
+            Some(orig),
+            vec![],
+            "proxy.example.com",
+            5060,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = vec![0u8; 8192];
+        let (n, _) = target.recv_from(&mut buf).await.unwrap();
+        parse_sip_message(&buf[..n]).unwrap();
+
+        let recv =
+            tokio::time::timeout(Duration::from_millis(600), client.recv_from(&mut buf)).await;
+        let (n, _) = recv.expect("timeout waiting for 408").expect("recv 408");
+        let msg = parse_sip_message(&buf[..n]).unwrap().1;
+        let SipMessage::Response(resp) = msg else {
+            panic!("expected response");
+        };
+        assert_eq!(resp.status, StatusCode::REQUEST_TIMEOUT);
+        assert!(table.read().await.is_empty());
+        assert!(transaction_table.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_expired_teardown_sends_bye_to_both_udp_ends() {
+        let caller = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let cfg = test_cfg();
+        let sip = test_sip_sender(&proxy);
+        let state = crate::dialog::DialogState {
+            route_set: vec![],
+            remote_target: "sip:bob@callee".to_string(),
+            from_party: NameAddr {
+                display_name: None,
+                uri: "sip:alice@example.com".to_string(),
+                tag: Some("from-tag".to_string()),
+                params: vec![],
+            },
+            to_party: NameAddr {
+                display_name: None,
+                uri: "sip:bob@example.com".to_string(),
+                tag: Some("to-tag".to_string()),
+                params: vec![],
+            },
+            cseq: 1,
+            caller_addr: caller.local_addr().unwrap(),
+            callee_addr: callee.local_addr().unwrap(),
+            caller_reply_ws: None,
+            session_expires: Some(30),
+            session_refresher: None,
+        };
+        let key = DialogKey {
+            call_id: "call-1".into(),
+            from_tag: "from-tag".into(),
+            to_tag: "to-tag".into(),
+        };
+        send_session_expired_teardown(&proxy, &sip, &cfg, &state, &key)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), callee.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for BYE to callee")
+            .unwrap();
+        let callee_msg = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), caller.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for BYE to caller")
+            .unwrap();
+        let caller_msg = String::from_utf8_lossy(&buf[..n]);
+        assert!(callee_msg.contains("BYE sip:bob@callee"));
+        assert!(callee_msg.contains("CSeq: 2 BYE"));
+        assert!(caller_msg.contains("BYE sip:alice@example.com"));
+        assert!(caller_msg.contains("Call-ID: call-1"));
+    }
+
+    #[tokio::test]
     async fn forward_next_fork_sends_invite_to_remaining_target() {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4511,7 +4868,8 @@ mod tests {
         };
 
         let transaction_table = new_transaction_table();
-        forward_next_fork(&socket, &cfg, &table, &transaction_table, pending)
+        let sip = test_sip_sender(&socket);
+        forward_next_fork(&socket, &sip, &cfg, &table, &transaction_table, pending)
             .await
             .unwrap();
 
@@ -4536,8 +4894,10 @@ mod tests {
         let cfg = test_cfg();
         let peer: SocketAddr = "127.0.0.1:5090".parse().unwrap();
         let ingress = ProxyIngress::udp(socket.clone(), peer);
+        let sip = test_sip_sender(&socket);
         forward_initial_invite(
             &ingress,
+            &sip,
             None,
             &table,
             &transaction_table,
@@ -4579,8 +4939,10 @@ mod tests {
         cfg.fork_parallel = false;
         let peer: SocketAddr = "127.0.0.1:5090".parse().unwrap();
         let ingress = ProxyIngress::udp(socket.clone(), peer);
+        let sip = test_sip_sender(&socket);
         forward_initial_invite(
             &ingress,
+            &sip,
             None,
             &table,
             &transaction_table,
@@ -4633,6 +4995,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-a", StatusCode(603)),
         )
         .await
@@ -4665,6 +5028,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-a", StatusCode::NOT_FOUND),
         )
         .await
@@ -4680,6 +5044,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-b", StatusCode::SERVICE_UNAVAILABLE),
         )
         .await
@@ -4714,6 +5079,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-a", StatusCode::OK),
         )
         .await
@@ -4729,6 +5095,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-b", StatusCode::OK),
         )
         .await
@@ -4755,6 +5122,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response_for_method("z9hG4bK-cancel", StatusCode::OK, Method::Cancel),
         )
         .await
@@ -4785,6 +5153,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-a", StatusCode::OK),
         )
         .await
@@ -4800,6 +5169,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-b", StatusCode(603)),
         )
         .await
@@ -4842,6 +5212,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-a", StatusCode::OK),
         )
         .await
@@ -4857,6 +5228,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_response("z9hG4bK-b", StatusCode::BUSY_HERE),
         )
         .await
@@ -4920,6 +5292,7 @@ mod tests {
             &crate::dialog::new_dialog_table(),
             &new_transaction_table(),
             &crate::dialog::new_refresh_table(),
+            test_session_tx(),
             proxy_failure_response(),
         )
         .await

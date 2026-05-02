@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         nonce_ttl_s: nonce_ttl,
         fork_parallel: config.proxy.fork_parallel,
         pg,
-        stir: build_stir_config(&config.stir),
+        stir: build_stir_config(&config.stir)?,
         max_message_bytes: config.transport.max_message_bytes,
         outbound_edge_uri: config.registrar.outbound_edge_uri.clone(),
         push_gateway_url: config.push.gateway_url.clone(),
@@ -156,8 +156,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_stir_config(cfg: &sipora_core::config::StirConfig) -> udp::StirConfig {
+fn build_stir_config(cfg: &sipora_core::config::StirConfig) -> anyhow::Result<udp::StirConfig> {
     use std::net::IpAddr;
+    use std::sync::Arc;
     // `mode` is normalized in `StirConfig::validate` (called from `SiporaConfig::load*`).
     let mode = match cfg.mode.as_str() {
         "disabled" => udp::StirMode::Disabled,
@@ -174,12 +175,25 @@ fn build_stir_config(cfg: &sipora_core::config::StirConfig) -> udp::StirConfig {
                 .ok()
         })
         .collect();
+    let trust_anchor_pem: Option<Arc<str>> = match cfg.trust_anchor_pem_path.as_deref() {
+        Some(path) if !path.is_empty() => {
+            let pem = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("stir: failed to read trust_anchor_pem_path={path:?}: {e}")
+            })?;
+            Some(Arc::from(pem.into_boxed_str()))
+        }
+        _ => None,
+    };
+    if matches!(mode, udp::StirMode::Strict) && trust_anchor_pem.is_none() {
+        anyhow::bail!("stir: strict mode requires trust_anchor_pem_path to load successfully");
+    }
     if !matches!(mode, udp::StirMode::Disabled) {
         tracing::info!(mode = %cfg.mode, peers = trusted_peer_ips.len(), "STIR/SHAKEN verification enabled");
     }
-    udp::StirConfig {
+    Ok(udp::StirConfig {
         mode,
         trusted_peer_ips,
         cert_cache: sipora_auth::stir::CertCache::new(),
-    }
+        trust_anchor_pem,
+    })
 }
