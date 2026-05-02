@@ -5,9 +5,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --bin sipora-b2bua
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) lib=x86_64-linux-gnu ;; arm64) lib=aarch64-linux-gnu ;; *) echo "unsupported arch: $arch"; exit 1 ;; esac; \
+    mkdir -p "/export/lib/$lib"; \
+    cp "/lib/$lib/libz.so.1" "/export/lib/$lib/libz.so.1"
 
-FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
+COPY --from=builder /export/lib/ /lib/
 COPY --from=builder /build/target/release/sipora-b2bua /usr/local/bin/
 EXPOSE 5060/udp 8080
 ENTRYPOINT ["sipora-b2bua"]

@@ -6,8 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 RUN cargo build --release --bin sipora-proxy
 
-FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
 COPY --from=builder /build/target/release/sipora-proxy /usr/local/bin/
 EXPOSE 5061 443 5065 8080
 ENTRYPOINT ["sipora-proxy"]
