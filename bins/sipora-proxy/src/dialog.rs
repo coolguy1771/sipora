@@ -44,6 +44,7 @@ impl DialogKey {
 
 #[derive(Debug, Clone)]
 pub struct DialogState {
+    /// Callee-side dialog route set (from 2xx Record-Route / Contact path).
     pub route_set: Vec<String>,
     pub remote_target: String,
     pub from_party: NameAddr,
@@ -53,6 +54,10 @@ pub struct DialogState {
     pub callee_addr: SocketAddr,
     /// When the INVITE arrived over WebSocket, BYE toward the caller uses this connection.
     pub caller_reply_ws: Option<String>,
+    /// Caller Contact from the inbound INVITE (Request-URI toward caller when set).
+    pub caller_remote_target: Option<String>,
+    /// Record-Route set from the inbound INVITE (dialog route toward caller).
+    pub caller_route_set: Vec<String>,
     pub session_expires: Option<u32>,
     pub session_refresher: Option<Refresher>,
 }
@@ -119,6 +124,7 @@ pub async fn insert_dialog_from_response(
     caller_addr: SocketAddr,
     callee_addr: SocketAddr,
     caller_reply_ws: Option<String>,
+    caller_invite: Option<&Request>,
 ) -> Option<DialogKey> {
     let key = response_dialog_key(response)?;
     let (session_expires, session_refresher) = response
@@ -141,6 +147,10 @@ pub async fn insert_dialog_from_response(
         Header::To(na) => Some(na.clone()),
         _ => None,
     })?;
+    let (caller_route_set, caller_remote_target) = match caller_invite {
+        Some(r) => (request_record_route_set(r), request_first_contact_uri(r)),
+        None => (Vec::new(), None),
+    };
     let state = DialogState {
         route_set: response_route_set(response),
         remote_target: response_remote_target(response)?,
@@ -150,6 +160,8 @@ pub async fn insert_dialog_from_response(
         caller_addr,
         callee_addr,
         caller_reply_ws,
+        caller_remote_target,
+        caller_route_set,
         session_expires,
         session_refresher,
     };
@@ -191,9 +203,8 @@ fn request_dialog_key(request: &Request) -> Option<DialogKey> {
     })
 }
 
-fn response_route_set(response: &Response) -> Vec<String> {
-    response
-        .headers
+fn headers_record_route_set(headers: &[Header]) -> Vec<String> {
+    headers
         .iter()
         .filter_map(|header| match header {
             Header::RecordRoute(routes) => Some(routes.clone()),
@@ -202,6 +213,18 @@ fn response_route_set(response: &Response) -> Vec<String> {
         .flatten()
         .rev()
         .collect()
+}
+
+fn response_route_set(response: &Response) -> Vec<String> {
+    headers_record_route_set(&response.headers)
+}
+
+fn request_record_route_set(req: &Request) -> Vec<String> {
+    headers_record_route_set(&req.headers)
+}
+
+fn request_first_contact_uri(req: &Request) -> Option<String> {
+    req.contacts().first().map(|c| c.uri.clone())
 }
 
 fn response_remote_target(response: &Response) -> Option<String> {
@@ -229,7 +252,7 @@ fn to_tag(header: &Header) -> Option<String> {
 mod tests {
     use super::*;
     use sipora_sip::types::header::{CSeq, ContactValue, NameAddr, Refresher};
-    use sipora_sip::types::message::SipVersion;
+    use sipora_sip::types::message::{Request, SipVersion};
     use sipora_sip::types::method::Method;
     use sipora_sip::types::status::StatusCode;
 
@@ -239,9 +262,10 @@ mod tests {
         let caller = "127.0.0.1:5060".parse().unwrap();
         let callee = "127.0.0.1:5070".parse().unwrap();
 
-        let key = insert_dialog_from_response(&table, &success_response(), caller, callee, None)
-            .await
-            .unwrap();
+        let key =
+            insert_dialog_from_response(&table, &success_response(), caller, callee, None, None)
+                .await
+                .unwrap();
 
         let state = table.get(&key).expect("dialog present");
         assert_eq!(state.remote_target, "sip:bob@callee.example.com");
@@ -251,8 +275,48 @@ mod tests {
         assert_eq!(state.callee_addr, callee);
         assert_eq!(state.session_expires, None);
         assert_eq!(state.session_refresher, None);
+        assert!(state.caller_route_set.is_empty());
+        assert!(state.caller_remote_target.is_none());
         assert_eq!(state.from_party.uri, "sip:alice@example.com");
         assert_eq!(state.to_party.uri, "sip:bob@example.com");
+    }
+
+    #[tokio::test]
+    async fn stores_caller_routing_from_invite_headers() {
+        let table = new_dialog_table();
+        let caller = "127.0.0.1:5060".parse().unwrap();
+        let callee = "127.0.0.1:5070".parse().unwrap();
+        let invite = Request {
+            method: Method::Invite,
+            uri: "sip:bob@example.com".to_string(),
+            version: SipVersion::V2_0,
+            headers: vec![
+                Header::RecordRoute(vec!["<sip:proxy.example.com;lr>".to_string()]),
+                Header::Contact(vec![ContactValue {
+                    uri: "sip:alice@10.0.0.1:5062;transport=udp".to_string(),
+                    q: None,
+                    expires: None,
+                    params: vec![],
+                }]),
+            ],
+            body: Vec::new(),
+        };
+        let key = insert_dialog_from_response(
+            &table,
+            &success_response(),
+            caller,
+            callee,
+            None,
+            Some(&invite),
+        )
+        .await
+        .unwrap();
+        let state = table.get(&key).expect("dialog present");
+        assert_eq!(
+            state.caller_remote_target.as_deref(),
+            Some("sip:alice@10.0.0.1:5062;transport=udp")
+        );
+        assert_eq!(state.caller_route_set, vec!["<sip:proxy.example.com;lr>"]);
     }
 
     #[tokio::test]
@@ -265,7 +329,7 @@ mod tests {
             delta_seconds: 90,
             refresher: Some(Refresher::Uac),
         });
-        let key = insert_dialog_from_response(&table, &resp, caller, callee, None)
+        let key = insert_dialog_from_response(&table, &resp, caller, callee, None, None)
             .await
             .unwrap();
         let state = table.get(&key).expect("dialog present");

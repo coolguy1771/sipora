@@ -244,11 +244,53 @@ fn verify_signed_by_anchor(
     cur: &x509_parser::certificate::X509Certificate<'_>,
     anchor: &x509_parser::certificate::X509Certificate<'_>,
 ) -> Result<(), StirError> {
+    assert_valid_ca_issuer(anchor, "trust anchor")?;
     cur.verify_signature(Some(anchor.public_key()))
         .map_err(|e| StirError::ChainInvalid(format!("signed-by-anchor verification: {e}")))?;
     anchor
         .verify_signature(None)
         .map_err(|e| StirError::ChainInvalid(format!("trust anchor self-signature: {e}")))?;
+    Ok(())
+}
+
+/// Enforce PKIX CA semantics for a certificate that may sign another cert in the chain.
+fn assert_valid_ca_issuer(
+    issuer: &x509_parser::certificate::X509Certificate<'_>,
+    ctx: &str,
+) -> Result<(), StirError> {
+    use x509_parser::extensions::ParsedExtension;
+
+    let mut has_basic_constraints = false;
+    let mut is_ca = false;
+    let mut saw_key_usage = false;
+    let mut key_cert_sign = false;
+
+    for ext in issuer.extensions() {
+        match ext.parsed_extension() {
+            ParsedExtension::BasicConstraints(bc) => {
+                has_basic_constraints = true;
+                is_ca = bc.ca;
+            }
+            ParsedExtension::KeyUsage(ku) => {
+                saw_key_usage = true;
+                key_cert_sign = ku.key_cert_sign();
+            }
+            _ => {}
+        }
+    }
+
+    if !has_basic_constraints || !is_ca {
+        return Err(StirError::ChainInvalid(format!(
+            "{ctx}: signing certificate must be a CA (basicConstraints cA true)"
+        )));
+    }
+
+    if saw_key_usage && !key_cert_sign {
+        return Err(StirError::ChainInvalid(format!(
+            "{ctx}: signing certificate lacks keyCertSign in keyUsage"
+        )));
+    }
+
     Ok(())
 }
 
@@ -286,6 +328,7 @@ fn verify_chain_to_trust_anchors(chain: &[Vec<u8>], anchors: &[Vec<u8>]) -> Resu
             let (_, nxt) = X509Certificate::from_der(chain[idx + 1].as_slice())
                 .map_err(|e| StirError::CertParse(e.to_string()))?;
             if nxt.subject() == cur.issuer() {
+                assert_valid_ca_issuer(&nxt, "chain issuer")?;
                 cur.verify_signature(Some(nxt.public_key()))
                     .map_err(|e| StirError::ChainInvalid(format!("chain signature: {e}")))?;
                 idx += 1;
@@ -297,6 +340,7 @@ fn verify_chain_to_trust_anchors(chain: &[Vec<u8>], anchors: &[Vec<u8>]) -> Resu
                 let (_, issuer) = X509Certificate::from_der(der.as_slice())
                     .map_err(|e| StirError::CertParse(e.to_string()))?;
                 if issuer.subject() == cur.issuer() {
+                    assert_valid_ca_issuer(&issuer, "chain issuer")?;
                     cur.verify_signature(Some(issuer.public_key()))
                         .map_err(|e| StirError::ChainInvalid(format!("chain signature: {e}")))?;
                     idx = j;

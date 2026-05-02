@@ -53,7 +53,7 @@ use crate::forward_table::{
     find_branch_by_call_id_and_rseq, find_branches_by_call_id, get_pending_forward, insert_forward,
     prepare_response, remove_pending_branch, spawn_forward_sweeper,
 };
-use crate::ingress::ProxyIngress;
+use crate::ingress::{ProxyIngress, ReplyTarget};
 use crate::message_sender::{MessageSender, MessageTarget};
 use crate::notify::{build_notify_request, dispatch_notify};
 use crate::routing::ProxyRouter;
@@ -1097,6 +1097,7 @@ async fn relay_final_response(
             pending.client_addr,
             pending.target_addr,
             pending.reply_ws_conn_id.clone(),
+            pending.original_request.as_ref(),
         )
         .await
         && let Some(se) = response_session_expires(&resp)
@@ -1247,7 +1248,7 @@ async fn handle_dialog_request(
         session_expires = ?state.session_expires,
         "routing in-dialog request"
     );
-    let target_uri = dialog_target_uri(&mut req, &state, cfg);
+    let target_uri = dialog_target_uri(ingress, &mut req, &state, cfg);
     let Some(target) = resolve_udp_target(&target_uri).await else {
         crate::ingress::respond(ingress, &overload_response(&req, 30)).await;
         return Ok(());
@@ -1284,12 +1285,38 @@ async fn handle_dialog_request(
     Ok(())
 }
 
-fn dialog_target_uri(req: &mut Request, state: &DialogState, cfg: &UdpProxyConfig) -> String {
+fn ingress_source_is_caller(ingress: &ProxyIngress, state: &DialogState) -> bool {
+    match &ingress.reply {
+        ReplyTarget::Ws { connection_id, .. } => {
+            state.caller_reply_ws.as_deref() == Some(connection_id.as_str())
+        }
+        _ => ingress.source == state.caller_addr,
+    }
+}
+
+fn dialog_target_uri(
+    ingress: &ProxyIngress,
+    req: &mut Request,
+    state: &DialogState,
+    cfg: &UdpProxyConfig,
+) -> String {
+    let toward_callee = !ingress_source_is_caller(ingress, state);
     let own_route = format!("sip:{}:{}", cfg.advertise, cfg.sip_port);
     strip_own_route(&mut req.headers, &own_route);
-    let target = next_route_uri(&req.headers)
-        .or_else(|| state.route_set.first().cloned())
-        .unwrap_or_else(|| state.remote_target.clone());
+    let target = if toward_callee {
+        next_route_uri(&req.headers)
+            .or_else(|| state.route_set.first().cloned())
+            .unwrap_or_else(|| state.remote_target.clone())
+    } else {
+        next_route_uri(&req.headers)
+            .or_else(|| state.caller_route_set.first().cloned())
+            .unwrap_or_else(|| {
+                state
+                    .caller_remote_target
+                    .clone()
+                    .unwrap_or_else(|| state.from_party.uri.clone())
+            })
+    };
     strip_name_addr(&target).to_string()
 }
 
@@ -1322,10 +1349,15 @@ fn strip_name_addr(uri: &str) -> &str {
     uri.trim().trim_start_matches('<').trim_end_matches('>')
 }
 
-fn build_dialog_bye_for_uri(state: &DialogState, key: &DialogKey, request_uri: &str) -> Request {
+fn build_dialog_bye_for_uri(
+    state: &DialogState,
+    key: &DialogKey,
+    request_uri: &str,
+    route_set: &[String],
+) -> Request {
     let mut headers = Vec::new();
-    if !state.route_set.is_empty() {
-        headers.push(Header::Route(state.route_set.clone()));
+    if !route_set.is_empty() {
+        headers.push(Header::Route(route_set.to_vec()));
     }
     headers.push(Header::From(state.from_party.clone()));
     headers.push(Header::To(state.to_party.clone()));
@@ -1354,13 +1386,20 @@ async fn send_session_expired_teardown(
     key: &DialogKey,
 ) -> anyhow::Result<()> {
     let callee_uri = strip_name_addr(&state.remote_target).to_string();
-    let caller_uri = strip_name_addr(&state.from_party.uri).to_string();
-    let mut bye_callee = build_dialog_bye_for_uri(state, key, &callee_uri);
+    let caller_uri = strip_name_addr(
+        state
+            .caller_remote_target
+            .as_deref()
+            .unwrap_or(state.from_party.uri.as_str()),
+    )
+    .to_string();
+    let mut bye_callee = build_dialog_bye_for_uri(state, key, &callee_uri, &state.route_set);
     let _ = prepend_proxy_via(&mut bye_callee, &cfg.advertise, cfg.sip_port);
     let b_callee = serialize_message(&SipMessage::Request(bye_callee));
     socket.send_to(&b_callee, state.callee_addr).await?;
 
-    let mut bye_caller = build_dialog_bye_for_uri(state, key, &caller_uri);
+    let caller_routes = state.caller_route_set.as_slice();
+    let mut bye_caller = build_dialog_bye_for_uri(state, key, &caller_uri, caller_routes);
     let _ = prepend_proxy_via(&mut bye_caller, &cfg.advertise, cfg.sip_port);
     match &state.caller_reply_ws {
         Some(conn_id) => {
@@ -1394,11 +1433,11 @@ async fn handle_session_expired(
         return Ok(());
     };
     cancel_session_guard(refresh_table, &key).await;
-    send_session_expired_teardown(socket, sip_sender, cfg, &state, &key).await?;
+    let send_res = send_session_expired_teardown(socket, sip_sender, cfg, &state, &key).await;
     let cid = key.call_id.clone();
     let _ = crate::refer_state::delete_refer_state(redis, &cid).await;
     remove_dialog(dialog_table, &key);
-    Ok(())
+    send_res
 }
 
 fn dialog_key_from_replaces_header(req: &Request) -> Option<DialogKey> {
@@ -4817,6 +4856,8 @@ mod tests {
             caller_addr: caller.local_addr().unwrap(),
             callee_addr: callee.local_addr().unwrap(),
             caller_reply_ws: None,
+            caller_remote_target: None,
+            caller_route_set: vec![],
             session_expires: Some(30),
             session_refresher: None,
         };
