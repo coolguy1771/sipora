@@ -1,0 +1,32 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
+  "syscalls": [
+    {
+      "comment": "Allow all syscalls needed by a Rust async binary (tokio + network I/O)",
+      "names": [
+        "accept4", "bind", "brk", "clock_gettime", "clock_nanosleep",
+        "clone", "close", "connect", "dup", "dup2", "dup3",
+        "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_wait",
+        "eventfd2", "execve", "exit", "exit_group",
+        "fcntl", "fstat", "fstatfs", "futex",
+        "getdents64", "getegid", "geteuid", "getgid", "getpid", "getppid",
+        "getrandom", "getrlimit", "getsockname", "getsockopt",
+        "gettid", "getuid", "ioctl",
+        "listen", "lseek", "madvise", "mmap", "mprotect", "mremap", "munmap",
+        "nanosleep", "newfstatat",
+        "open", "openat", "pipe2", "poll", "ppoll", "prctl",
+        "pread64", "preadv", "preadv2", "pwrite64", "pwritev",
+        "read", "readlink", "readv", "recvfrom", "recvmsg",
+        "restart_syscall", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+        "sched_getaffinity", "sched_yield",
+        "sendmsg", "sendto", "set_robust_list", "setgid", "setuid",
+        "setsockopt", "shutdown", "sigaltstack",
+        "socket", "socketpair", "stat", "statfs", "statx",
+        "tgkill", "timerfd_create", "timerfd_settime",
+        "uname", "wait4", "write", "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
