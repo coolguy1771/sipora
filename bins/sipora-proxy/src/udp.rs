@@ -2507,10 +2507,29 @@ async fn message_send_digest_challenge_with_algorithms(
             .await;
             return Ok(());
         }
-        challenges.push(register::register_challenge_header(
-            *algorithm, realm, &nonce, stale,
-        ));
-        stored_nonces.push(nonce);
+        match register::register_challenge_header(*algorithm, realm, &nonce, stale) {
+            Ok(header) => {
+                challenges.push(header);
+                stored_nonces.push(nonce);
+            }
+            Err(e) => {
+                if let Err(r) = register::invalidate_register_nonce(redis, &nonce).await {
+                    tracing::warn!(%r, %nonce, "message nonce rollback after challenge header error");
+                }
+                register::rollback_register_challenge_nonces(redis, &stored_nonces).await;
+                tracing::warn!(
+                    %e,
+                    algorithm = %algorithm.as_str(),
+                    "message challenge header"
+                );
+                crate::ingress::respond(
+                    ingress,
+                    &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+                )
+                .await;
+                return Ok(());
+            }
+        }
     }
     crate::ingress::respond(ingress, &sip_response_multi_proxy_auth(req, &challenges)).await;
     Ok(())

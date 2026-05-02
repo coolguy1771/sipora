@@ -35,6 +35,19 @@ use super::{
     parse_sip_user_host,
 };
 
+/// Stable non-identifying tag for logs (SHA-256 hex prefix of username bytes).
+fn username_log_tag(username: &str) -> String {
+    use core::fmt::Write;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(username.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in digest.iter() {
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex.truncate(16);
+    format!("u#{hex}")
+}
+
 fn register_authorization_value(req: &Request) -> Option<&str> {
     let raw = req.headers.iter().find_map(|h| match h {
         Header::Authorization(v) => Some(v.as_str()),
@@ -69,7 +82,10 @@ pub(super) async fn register_nonce_exists(redis: &RedisPool, nonce: &str) -> any
     Ok(n > 0)
 }
 
-async fn invalidate_register_nonce(redis: &RedisPool, nonce: &str) -> anyhow::Result<()> {
+pub(super) async fn invalidate_register_nonce(
+    redis: &RedisPool,
+    nonce: &str,
+) -> anyhow::Result<()> {
     let key = register_digest_nonce_key(nonce);
     let _: i64 = redis.del(&key).await?;
     Ok(())
@@ -331,8 +347,29 @@ async fn register_send_digest_challenge_with_algorithms(
             .await;
             return Ok(());
         }
-        challenges.push(register_challenge_header(*algorithm, realm, &nonce, stale));
-        stored_nonces.push(nonce);
+        match register_challenge_header(*algorithm, realm, &nonce, stale) {
+            Ok(header) => {
+                challenges.push(header);
+                stored_nonces.push(nonce);
+            }
+            Err(e) => {
+                if let Err(r) = invalidate_register_nonce(redis, &nonce).await {
+                    tracing::warn!(%r, %nonce, "register nonce rollback after challenge header error");
+                }
+                rollback_register_challenge_nonces(redis, &stored_nonces).await;
+                tracing::warn!(
+                    %e,
+                    algorithm = %algorithm.as_str(),
+                    "register challenge header"
+                );
+                crate::ingress::respond(
+                    ingress,
+                    &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
+                )
+                .await;
+                return Ok(());
+            }
+        }
     }
     crate::ingress::respond(ingress, &sip_response_multi_www_auth(req, &challenges)).await;
     Ok(())
@@ -346,21 +383,34 @@ pub(super) async fn rollback_register_challenge_nonces(redis: &RedisPool, nonces
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RegisterChallengeHeaderError;
+
+impl std::fmt::Display for RegisterChallengeHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session digest algorithm not supported for REGISTER challenge"
+        )
+    }
+}
+
+impl std::error::Error for RegisterChallengeHeaderError {}
+
 pub(super) fn register_challenge_header(
     algorithm: DigestAlgorithm,
     realm: &str,
     nonce: &str,
     stale: bool,
-) -> String {
-    match algorithm {
+) -> Result<String, RegisterChallengeHeaderError> {
+    let challenge = match algorithm {
         DigestAlgorithm::Sha256 => DigestChallenge::new_sha256(realm, nonce),
         DigestAlgorithm::Md5 => DigestChallenge::new_md5(realm, nonce),
         DigestAlgorithm::Md5Sess | DigestAlgorithm::Sha256Sess => {
-            unreachable!("REGISTER challenges use non-session algorithms")
+            return Err(RegisterChallengeHeaderError);
         }
-    }
-    .with_stale(stale)
-    .to_www_authenticate()
+    };
+    Ok(challenge.with_stale(stale).to_www_authenticate())
 }
 
 fn register_call_id_cseq(req: &Request) -> Option<(&str, u32)> {
@@ -446,7 +496,7 @@ async fn register_try_acquire_commit_lock(
 ) -> anyhow::Result<Option<(String, String)>> {
     match register_tx_ok_exists(redis, call_id, cseq_n).await {
         Ok(true) => {
-            crate::ingress::respond(ingress, &SipMessage::Response(simple_ok(req))).await;
+            crate::ingress::respond(ingress, &simple_ok(req)).await;
             return Ok(None);
         }
         Ok(false) => {}
@@ -463,7 +513,7 @@ async fn register_try_acquire_commit_lock(
         Ok(None) => {
             match register_tx_ok_exists(redis, call_id, cseq_n).await {
                 Ok(true) => {
-                    crate::ingress::respond(ingress, &SipMessage::Response(simple_ok(req))).await;
+                    crate::ingress::respond(ingress, &simple_ok(req)).await;
                 }
                 Ok(false) => {
                     tracing::warn!("register redis (tx ok false after lock miss; commit pending)");
@@ -682,7 +732,7 @@ async fn register_missing_selected_ha1(
 ) -> anyhow::Result<()> {
     tracing::warn!(
         algorithm = %dr.algorithm.as_str(),
-        username = %dr.username,
+        username = %username_log_tag(&dr.username),
         realm = %dr.realm,
         "REGISTER digest: missing HA1 for selected digest algorithm"
     );
@@ -723,12 +773,19 @@ async fn register_effective_ha1(
     match effective_stored_ha1_for_digest(dr, ha1) {
         Ok(h) => Some(h),
         Err(EffectiveHa1Error::MissingCnonce) => {
-            tracing::warn!(username = %dr.username, "REGISTER digest -sess without cnonce");
+            tracing::warn!(
+                username = %username_log_tag(&dr.username),
+                "REGISTER digest -sess without cnonce"
+            );
             crate::ingress::respond(ingress, &sip_response(req, StatusCode::FORBIDDEN)).await;
             None
         }
         Err(e) => {
-            tracing::warn!(%e, username = %dr.username, "REGISTER digest HA1 derive");
+            tracing::warn!(
+                %e,
+                username = %username_log_tag(&dr.username),
+                "REGISTER digest HA1 derive"
+            );
             crate::ingress::respond(
                 ingress,
                 &sip_response(req, StatusCode::SERVER_INTERNAL_ERROR),
