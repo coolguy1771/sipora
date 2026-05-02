@@ -22,5 +22,7 @@ echo "postgres://sipora:$(cat postgres_password)@postgres:5432/sipora?sslmode=di
 openssl rand -base64 24 > grafana_admin_password
 ```
 
+After creating the files, restrict permissions so only the owner can read or write them (for example `chmod 600 postgres_password valkey_password api_bearer_token db_url grafana_admin_password`). Confirm each file is owned by the account that runs Compose (or the deployment user) and is not world- or group-readable. In CI and automation, set a restrictive `umask` (for example `umask 077`) before writing secrets, or create files via your secrets manager with correct ownership and mode, then verify with `ls -l` that mode and owner match expectations. When a host copy of these files is no longer needed, delete them or move the material into your organization's credential store so plaintext secrets do not linger on disk.
+
 Files in this directory are excluded from git (see `.gitignore`).
 In CI/CD, inject secrets via your secrets manager (Vault, AWS SM, GitHub Secrets) rather than committing files.

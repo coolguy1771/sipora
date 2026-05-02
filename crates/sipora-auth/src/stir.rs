@@ -637,16 +637,17 @@ mod tests {
 
     #[tokio::test]
     async fn stir_chain_accepts_leaf_signed_by_trusted_ca() {
-        use rcgen::{CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+        use rcgen::{CertificateParams, IsCa, Issuer, KeyPair, PKCS_ECDSA_P256_SHA256};
 
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = CertificateParams::new(vec![]).unwrap();
         ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
 
         let ee_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let ee_params = CertificateParams::new(vec!["sip.stir.test".into()]).unwrap();
-        let ee_cert = ee_params.signed_by(&ee_key, &ca_cert, &ca_key).unwrap();
+        let ee_cert = ee_params.signed_by(&ee_key, &ca_issuer).unwrap();
 
         let chain_pem = format!("{}{}", ee_cert.pem(), ca_cert.pem());
         let anchor_pem = ca_cert.pem();
@@ -675,16 +676,17 @@ mod tests {
 
     #[tokio::test]
     async fn stir_chain_rejects_wrong_trust_anchor() {
-        use rcgen::{CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+        use rcgen::{CertificateParams, IsCa, Issuer, KeyPair, PKCS_ECDSA_P256_SHA256};
 
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = CertificateParams::new(vec![]).unwrap();
         ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
 
         let ee_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let ee_params = CertificateParams::new(vec!["sip.stir.test".into()]).unwrap();
-        let ee_cert = ee_params.signed_by(&ee_key, &ca_cert, &ca_key).unwrap();
+        let ee_cert = ee_params.signed_by(&ee_key, &ca_issuer).unwrap();
 
         let chain_pem = format!("{}{}", ee_cert.pem(), ca_cert.pem());
 

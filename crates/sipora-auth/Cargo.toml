@@ -33,4 +33,4 @@ url = { workspace = true }
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["pkcs8", "pem", "ecdsa"] }
-rcgen = "0.13"
+rcgen = "0.14"
