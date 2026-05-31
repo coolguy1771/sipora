@@ -17,6 +17,8 @@ spec:
         app.kubernetes.io/name: sipora-api
     spec:
       serviceAccountName: sipora-api
+      securityContext:
+        {{- include "sipora.podSecurityContext" . | nindent 8 }}
       containers:
         - name: sipora-api
           image: "{{ .Values.image.registry }}sipora/sipora-api:{{ .Values.image.tag }}"

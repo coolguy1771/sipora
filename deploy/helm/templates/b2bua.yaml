@@ -17,6 +17,8 @@ spec:
         app.kubernetes.io/name: sipora-b2bua
     spec:
       serviceAccountName: sipora-b2bua
+      securityContext:
+        {{- include "sipora.podSecurityContext" . | nindent 8 }}
       containers:
         - name: sipora-b2bua
           image: "{{ .Values.image.registry }}sipora/sipora-b2bua:{{ .Values.image.tag }}"

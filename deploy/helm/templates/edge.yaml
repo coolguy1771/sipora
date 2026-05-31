@@ -17,6 +17,8 @@ spec:
         app.kubernetes.io/name: sipora-edge
     spec:
       serviceAccountName: sipora-edge
+      securityContext:
+        {{- include "sipora.podSecurityContext" . | nindent 8 }}
       containers:
         - name: sipora-edge
           image: "{{ .Values.image.registry }}sipora/sipora-edge:{{ .Values.image.tag }}"

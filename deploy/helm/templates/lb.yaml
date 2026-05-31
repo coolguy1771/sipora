@@ -16,6 +16,8 @@ spec:
       labels:
         app.kubernetes.io/name: sipora-lb
     spec:
+      securityContext:
+        {{- include "sipora.podSecurityContext" . | nindent 8 }}
       serviceAccountName: sipora-lb
       containers:
         - name: sipora-lb

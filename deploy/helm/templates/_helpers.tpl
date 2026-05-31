@@ -59,3 +59,10 @@ B2BUA downstream host:port (required at runtime).
 {{- define "sipora.b2buaDownstream" -}}
 {{- .Values.config.b2bua.downstream | default (printf "sipora-proxy.%s.svc.cluster.local:%v" .Release.Namespace .Values.config.general.sipUdpPort) -}}
 {{- end }}
+
+{{/*
+Pod security context.
+*/}}
+{{- define "sipora.podSecurityContext" -}}
+runAsNonRoot: {{ .Values.podSecurityContext.runAsNonRoot }}
+{{- end }}

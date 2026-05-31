@@ -17,6 +17,8 @@ spec:
         app.kubernetes.io/name: sipora-proxy
     spec:
       serviceAccountName: sipora-proxy
+      securityContext:
+        {{- include "sipora.podSecurityContext" . | nindent 8 }}
       containers:
         - name: sipora-proxy
           image: "{{ .Values.image.registry }}sipora/sipora-proxy:{{ .Values.image.tag }}"

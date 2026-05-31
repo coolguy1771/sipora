@@ -5,6 +5,9 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+podSecurityContext:
+  runAsNonRoot: true
+
 edge:
   replicas: 2
   resources:
