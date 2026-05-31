@@ -5,8 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --bin sipora-lb
+RUN useradd -U -u 1000 appuser && chown -R 1000:1000 /build/target/release/sipora-lb
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
 COPY --from=builder /build/target/release/sipora-lb /usr/local/bin/
 EXPOSE 5061 443 8080
+USER 1000
 ENTRYPOINT ["sipora-lb"]

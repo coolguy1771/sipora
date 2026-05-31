@@ -12,7 +12,8 @@ RUN set -eux; \
     cp "/lib/$lib/libz.so.1" "/export/lib/$lib/libz.so.1"
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
-COPY --from=builder /export/lib/ /lib/
-COPY --from=builder /build/target/release/sipora-b2bua /usr/local/bin/
+COPY --from=builder --chown=1000:1000 /export/lib/ /lib/
+COPY --from=builder --chown=1000:1000 /build/target/release/sipora-b2bua /usr/local/bin/
 EXPOSE 5060/udp 8080
+USER 1000
 ENTRYPOINT ["sipora-b2bua"]

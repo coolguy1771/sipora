@@ -7,6 +7,7 @@ COPY . .
 RUN cargo build --release --bin sipora-edge
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
-COPY --from=builder /build/target/release/sipora-edge /usr/local/bin/
+COPY --from=builder --chown=65532:65532 /build/target/release/sipora-edge /usr/local/bin/
 EXPOSE 5061 443 5065 8080
+USER 65532
 ENTRYPOINT ["sipora-edge"]
