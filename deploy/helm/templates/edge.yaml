@@ -30,6 +30,8 @@ spec:
               containerPort: {{ .Values.edge.ports.outbound }}
             - name: health
               containerPort: {{ .Values.edge.ports.health }}
+          securityContext:
+            {{- include "sipora.securityContext" . | nindent 12 }}
           env:
             - name: SIPORA__GENERAL__DOMAIN
               value: {{ .Values.config.domain | quote }}

@@ -21,6 +21,8 @@ spec:
         - name: sipora-b2bua
           image: "{{ .Values.image.registry }}sipora/sipora-b2bua:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "sipora.securityContext" . | nindent 12 }}
           ports:
             - name: sip-udp
               protocol: UDP

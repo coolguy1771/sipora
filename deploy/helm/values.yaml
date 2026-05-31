@@ -1,5 +1,8 @@
 namespace: sip-platform
 
+securityContext:
+  allowPrivilegeEscalation: false
+
 image:
   registry: ""
   tag: latest
